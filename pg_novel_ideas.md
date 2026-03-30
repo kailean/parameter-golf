@@ -264,35 +264,43 @@ class EngramLiteEmbedding(nn.Module):
         - Sigmoid gate (from context) scales the output
       - Sum across orders → output
     
-    Parameter budget:
-      bigram_table: hash_size × dim × K_heads
-      trigram_table: hash_size × dim × K_heads  
-      gate_proj: (order_count × dim) × dim
+    Parameter budget (adjusted for 16MB constraint):
+      bigram_table: 2048 × 128 × 2 heads = 524K params
+      trigram_table: 2048 × 128 × 2 heads = 524K params
+      projection: 128 × 1024 = 131K params
+      gate: 128 × 2 + 2 = 258 params
+      Total: ~1.2M params ≈ 0.9MB in int6 — fits easily
     """
-    def __init__(self, hash_size: int = 8192, dim: int = 1024, 
-                 n_heads: int = 4, orders: tuple = (2, 3)):
+    def __init__(self, hash_size: int = 2048, embed_dim: int = 128,
+                 output_dim: int = 1024, n_heads: int = 2, 
+                 orders: tuple = (2, 3)):
         super().__init__()
         self.hash_size = hash_size
-        self.dim = dim
+        self.embed_dim = embed_dim
+        self.output_dim = output_dim
         self.n_heads = n_heads
         self.orders = orders
         
         # Hash primes for multi-head hashing (different prime per head)
         self.primes = [31337, 59999, 73721, 97531][:n_heads]
         
-        # Separate embedding table per order
+        # Separate embedding table per order (small embed_dim, projected later)
         self.tables = {}
         for order in orders:
-            table = nn.Embedding(hash_size, dim)
+            table = nn.Embedding(hash_size, embed_dim)
             # Small init — these are additive corrections
             table.weight = table.weight * 0.01
             self.tables[f'order_{order}'] = table
         
+        # Project from embed_dim to output_dim (vocab_size or model_dim)
+        self.proj = nn.Linear(embed_dim, output_dim, bias=False)
+        
         # Learned gate: context → sigmoid scalar per position
         # Input: concatenated n-gram context embeddings
-        self.gate_proj = nn.Linear(dim, len(orders), bias=True)
-        # Initialize gate bias negative → starts mostly suppressed
+        self.gate_proj = nn.Linear(embed_dim, len(orders), bias=True)
+        # Initialize gate bias to -2.0 → sigmoid(-2) ≈ 0.12 → starts mostly suppressed
         # Model learns to trust hash lookups as training progresses
+        self.gate_proj.bias = mx.full((len(orders),), -2.0)
     
     def _hash_ngram(self, tokens, order, head_idx):
         """Hash n-gram context to table index."""
@@ -323,10 +331,10 @@ class EngramLiteEmbedding(nn.Module):
     def __call__(self, tokens):
         """
         tokens: (B, T) int32
-        Returns: (B, T, dim) — additive logit bias
+        Returns: (B, T, output_dim) — additive logit bias
         """
         B, T = tokens.shape
-        output = mx.zeros((B, T, self.dim))
+        output = mx.zeros((B, T, self.embed_dim))
         
         for oi, order in enumerate(self.orders):
             table = self.tables[f'order_{order}']
@@ -335,19 +343,24 @@ class EngramLiteEmbedding(nn.Module):
             head_embeds = []
             for hi in range(self.n_heads):
                 idx, valid_start = self._hash_ngram(tokens, order, hi)
-                emb = table(idx)  # (B, T-order+1, dim)
+                emb = table(idx)  # (B, T-order+1, embed_dim)
                 head_embeds.append(emb)
             
             # Mean pool across heads — reduces collision noise
-            ngram_emb = sum(head_embeds) / self.n_heads  # (B, T-valid_start, dim)
+            ngram_emb = sum(head_embeds) / self.n_heads  # (B, T-valid_start, embed_dim)
             
             # Pad to full sequence length
-            pad = mx.zeros((B, valid_start, self.dim))
-            ngram_emb = mx.concatenate([pad, ngram_emb], axis=1)  # (B, T, dim)
+            pad = mx.zeros((B, valid_start, self.embed_dim))
+            ngram_emb = mx.concatenate([pad, ngram_emb], axis=1)  # (B, T, embed_dim)
             
             output = output + ngram_emb
         
-        return output
+        # Project to output dimension and apply gate
+        gated = mx.sigmoid(self.gate_proj(output))  # (B, T, n_orders)
+        # Average gate across orders for simplicity
+        gate_scalar = gated.mean(axis=-1, keepdims=True)  # (B, T, 1)
+        
+        return self.proj(output) * gate_scalar  # (B, T, output_dim)
 
 
 # PROOF-OF-CONCEPT: Skip-Gram Hash Embedding  
@@ -777,17 +790,15 @@ Sub-1.10 is clearly achievable. Sub-1.05 is plausible. Sub-1.00 is at the edge o
 
 **Smoke test plan (M1, 100 steps):**
 1. Replace `BigramHashEmbedding` with `EngramLiteEmbedding` in model
-2. Config: hash_size=4096, dim=1024, n_heads=2, orders=(2,3)
+2. Config: hash_size=2048, embed_dim=128, output_dim=1024, n_heads=2, orders=(2,3)
 3. Train 100 steps, compare train_loss vs BigramHash baseline
 4. Expected: comparable or slightly better loss (gating suppresses noise)
 
 **Key implementation notes:**
 - The gating mechanism is essential — without it, trigrams hurt (#609)
 - Multi-head averaging reduces hash collision noise
-- Parameter budget: 2 tables × 4096 × 1024 × 2 heads ≈ 16M params in int6 ≈ 12MB
-  - This is too large! Need dim=128 with projection, or hash_size=2048
-  - Adjusted: hash_size=2048, dim=128, projected to vocab_size (1024)
-  - Budget: 2 × 2048 × 128 × 2 ≈ 1M params ≈ 0.75MB — fits easily
+- Parameter budget: 2 tables × 2048 × 128 × 2 heads + projection (128×1024) ≈ 1.2M params
+  - In int6+zstd: ~0.9MB — fits within 16MB budget easily
 
 ### POC 3: Skip-Gram Hash + Shallow Recurrence Combo
 
@@ -820,24 +831,22 @@ class ShallowRecurrentGPT:
     def __init__(self, config):
         # ... (standard init) ...
         
-        # Per-pass scalars for recurrent layers
-        # pass_scale[layer_idx][pass_idx] = learnable scalar
+        # Per-pass scalars for recurrent layers (pseudocode — actual impl
+        # would use nn.Module parameters for gradient tracking)
         self.recur_layers = [4, 5]  # Which layers to repeat
         self.n_passes = 2  # Original + 1 repeat
         
-        # Learnable scale/shift per pass (FiLM-lite)
-        # 2 recurrent layers × 2 passes × 2 (scale + shift) = 8 params
+        # Learnable scale per pass (FiLM-lite)
+        # 2 recurrent layers × 1 repeat = 2 learnable scalars
+        # In real implementation: self.pass_scales = {key: nn.Parameter(mx.array(0.9))}
         self.pass_scales = {}
         for layer_idx in self.recur_layers:
             for pass_idx in range(self.n_passes):
                 key = f'layer{layer_idx}_pass{pass_idx}'
-                # Pass 0 (original): scale=1.0, shift=0.0
-                # Pass 1 (repeat): scale=0.9, shift=0.0 (slightly dampened)
                 if pass_idx == 0:
-                    self.pass_scales[key] = 1.0  # Fixed, not learned
+                    self.pass_scales[key] = 1.0  # Fixed (original pass)
                 else:
-                    # Small init perturbation from pass 0
-                    self.pass_scales[key] = 0.9  # nn.Parameter, learned
+                    self.pass_scales[key] = 0.9  # Learnable (repeated pass)
     
     def forward(self, x):
         """
