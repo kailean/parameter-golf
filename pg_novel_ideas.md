@@ -914,6 +914,20 @@ class ShallowRecurrentGPT:
 
 ### Complementary Training + EngramLite + BackoffNgramMixer: The Integrated Stack
 
+**Status: IMPLEMENTED** in `train_gpt_mlx_kl.py` (April 2026).
+
+**Env vars for full moonshot run (8×H100):**
+```
+ENGRAM_LITE_ENABLED=1 COMPLEMENT_ALPHA=0.5 NGRAM_MIXER_ENABLED=1 NGRAM_ALPHA=0.25 NGRAM_MAX_ORDER=4
+```
+
+**Smoke test (M1, 100 steps):**
+```
+RUN_ID=moonshot_test ITERATIONS=100 TRAIN_BATCH_TOKENS=8192 VAL_LOSS_EVERY=0 VAL_BATCH_SIZE=8192 \
+WARMUP_STEPS=3 ENGRAM_LITE_ENABLED=1 COMPLEMENT_ALPHA=0.5 NGRAM_MIXER_ENABLED=1 EVAL_MODE=standard \
+python3 train_gpt_mlx_kl.py
+```
+
 **Why this is the single best bet nobody has fully combined:**
 
 The top competition results reveal three independent discoveries that, when properly integrated, form a system greater than the sum of its parts:
