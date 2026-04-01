@@ -74,6 +74,26 @@ class Hyperparameters:
     use_swa: bool = bool(int(os.environ.get("USE_SWA", "0")))
     swa_decay: float = float(os.environ.get("SWA_DECAY", "0.4"))
 
+    # EngramLite: gated multi-head bigram+trigram hash (replaces BigramHash when enabled)
+    # Proven by #1089 to reach 1.1086 BPB vs plain BigramHash
+    engram_lite_enabled: bool = bool(int(os.environ.get("ENGRAM_LITE_ENABLED", "1")))
+    engram_hash_size: int = int(os.environ.get("ENGRAM_HASH_SIZE", 8192))
+    engram_embed_dim: int = int(os.environ.get("ENGRAM_EMBED_DIM", 256))
+    engram_n_heads: int = int(os.environ.get("ENGRAM_N_HEADS", 2))
+
+    # SkipGram hash: non-contiguous token position patterns (untried, moderate EV)
+    skipgram_hash_size: int = int(os.environ.get("SKIPGRAM_HASH_SIZE", 0))  # 0 = disabled
+
+    # Complementary Training: down-weight n-gram-predictable tokens in loss (#803)
+    # Requires pre-computing bigram stats from training data (one-time at startup)
+    complement_alpha: float = float(os.environ.get("COMPLEMENT_ALPHA", "0.0"))
+
+    # BackoffNgramMixer: eval-time n-gram cache with entropy-adaptive mixing (#1094)
+    # Zero artifact cost (built from val tokens scored so far, causal)
+    ngram_mixer_enabled: bool = bool(int(os.environ.get("NGRAM_MIXER_ENABLED", "0")))
+    ngram_max_order: int = int(os.environ.get("NGRAM_MAX_ORDER", "4"))
+    ngram_alpha: float = float(os.environ.get("NGRAM_ALPHA", "0.25"))  # mixing weight
+
     # SOTA techniques (Tasks 3-4)
     smear_enabled: bool    = bool(int(os.environ.get("USE_SMEARGATE", os.environ.get("SMEAR_ENABLED", "1"))))  # 3b: learnable prev-token gate (USE_SMEARGATE=alias)
     rope_dims: int         = int(os.environ.get("ROPE_DIMS", 16))             # 3f: partial RoPE dims; 0 = no RoPE
@@ -248,6 +268,158 @@ class BigramHashEmbedding(nn.Module):
         return mx.concatenate([pad, bigram_emb], axis=1)  # (B, T, dim)
 
 # ============================================================================
+# MOONSHOT INNOVATION: EngramLite — gated multi-head bigram+trigram hash
+# Proved by #1089 to improve over plain BigramHash. Gating essential (#609):
+# raw TrigramHash hurts (+0.0049 BPB), but with learned gate it helps.
+# ============================================================================
+class EngramLiteEmbedding(nn.Module):
+    """
+    Gated multi-head n-gram hash embedding (bigram + trigram).
+    Replaces BigramHashEmbedding when engram_lite_enabled=True.
+
+    Architecture:
+      - bigram: K hash-heads → average → embed_dim
+      - trigram: K hash-heads → average → embed_dim
+      - Separate learned gate per order (initialized suppressed)
+      - Shared projection: embed_dim → vocab_size (logit bias)
+
+    Parameter count vs BigramHash(16384, 1024):
+      BigramHash:  16384 × 1024                              = 16.78M params
+      EngramLite:  2 × n_heads × hash_size × embed_dim + embed_dim × vocab_size
+                   = 2 × 2 × 8192 × 256 + 256 × 1024        = 8.39M + 0.26M = 8.65M params
+    """
+    # 6 primes so users can experiment with n_heads up to 6 without code changes
+    _PRIMES = [31337, 59999, 73721, 97531, 104729, 131071]
+    _MAX_HEADS = len(_PRIMES)
+
+    def __init__(self, hash_size: int, vocab_size: int,
+                 embed_dim: int = 256, n_heads: int = 2):
+        super().__init__()
+        if n_heads > self.__class__._MAX_HEADS:
+            raise ValueError(
+                f"n_heads={n_heads} > max supported {self.__class__._MAX_HEADS}")
+        self.hash_size = hash_size
+        self.vocab_size = vocab_size
+        self.embed_dim = embed_dim
+        self.n_heads = n_heads
+
+        # Separate tables per order and per head (lists are tracked by MLX)
+        self.bigram_tables  = [nn.Embedding(hash_size, embed_dim) for _ in range(n_heads)]
+        self.trigram_tables = [nn.Embedding(hash_size, embed_dim) for _ in range(n_heads)]
+
+        # Projection to vocab_size (shared across orders — bottleneck acts as regularizer)
+        self.proj = nn.Linear(embed_dim, vocab_size, bias=False)
+
+        # Per-order learned gate scalars (1D → scalar optimizer, not Muon)
+        # Initialized very small so n-gram contribution starts near zero, learns to grow
+        self.bigram_gate  = mx.full((1,), -2.0, dtype=mx.float32)  # sigmoid(-2) ≈ 0.12
+        self.trigram_gate = mx.full((1,), -3.0, dtype=mx.float32)  # sigmoid(-3) ≈ 0.05
+
+        # Small init for hash tables and projection
+        for t in self.bigram_tables + self.trigram_tables:
+            t.weight = t.weight * 0.01
+        self.proj.weight = self.proj.weight * 0.02
+
+    def _bigram_emb(self, tokens: mx.array) -> mx.array:
+        """Average K bigram-head lookups.  Returns (B, T-1, embed_dim)."""
+        t_prev = tokens[:, :-1]
+        t_curr = tokens[:, 1:]
+        acc = None
+        for hi in range(self.n_heads):
+            idx = mx.remainder(t_prev * self._PRIMES[hi] + t_curr, self.hash_size)
+            emb = self.bigram_tables[hi](idx)
+            acc = emb if acc is None else acc + emb
+        return acc / self.n_heads  # type: ignore[operator]
+
+    def _trigram_emb(self, tokens: mx.array) -> mx.array:
+        """Average K trigram-head lookups.  Returns (B, T-2, embed_dim)."""
+        t2 = tokens[:, :-2]
+        t1 = tokens[:, 1:-1]
+        tc = tokens[:, 2:]
+        acc = None
+        for hi in range(self.n_heads):
+            p = self._PRIMES[hi]
+            idx = mx.remainder(t2 * (p * p) + t1 * p + tc, self.hash_size)
+            emb = self.trigram_tables[hi](idx)
+            acc = emb if acc is None else acc + emb
+        return acc / self.n_heads  # type: ignore[operator]
+
+    def __call__(self, tokens: mx.array) -> mx.array:
+        """tokens: (B, T) int32 → (B, T, vocab_size) additive logit bias"""
+        B, T = tokens.shape
+        z = mx.float32
+
+        # --- bigram ---
+        bi_raw = self._bigram_emb(tokens)  # (B, T-1, embed_dim)
+        pad1 = mx.zeros((B, 1, self.embed_dim), dtype=bi_raw.dtype)
+        bi = mx.concatenate([pad1, bi_raw], axis=1)  # (B, T, embed_dim)
+
+        # --- trigram ---
+        if T > 2:
+            tri_raw = self._trigram_emb(tokens)  # (B, T-2, embed_dim)
+            pad2 = mx.zeros((B, 2, self.embed_dim), dtype=tri_raw.dtype)
+            tri = mx.concatenate([pad2, tri_raw], axis=1)  # (B, T, embed_dim)
+        else:
+            tri = mx.zeros((B, T, self.embed_dim), dtype=bi.dtype)
+
+        # --- gated combination → project ---
+        g_bi  = mx.sigmoid(self.bigram_gate.astype(z))   # (1,)
+        g_tri = mx.sigmoid(self.trigram_gate.astype(z))  # (1,)
+        combined = g_bi[0] * bi.astype(z) + g_tri[0] * tri.astype(z)  # (B, T, embed_dim)
+        return self.proj(combined)  # (B, T, vocab_size)
+
+
+# ============================================================================
+# MOONSHOT INNOVATION: SkipGramHashEmbedding
+# Hash of non-contiguous token positions (untried in competition, Tier 2).
+# Captures patterns with intervening variable content (HTML, code, prose templates).
+# ============================================================================
+class SkipGramHashEmbedding(nn.Module):
+    """
+    Additive logit bias from skip-gram hashes.
+    Uses two skip patterns: tokens at (t-1, t-3) and (t-1, t-5).
+    Shared hash table + learned gate to avoid noise.
+    """
+    _PRIMES = [31337, 59999]
+
+    def __init__(self, hash_size: int, vocab_size: int):
+        super().__init__()
+        self.hash_size = hash_size
+        # Direct vocab-size output (no projection bottleneck for skip-grams)
+        self.table = nn.Embedding(hash_size, vocab_size)
+        self.table.weight = self.table.weight * 0.005
+        # Learned gate per skip pattern
+        self.skip_gate = mx.full((2,), -2.5, dtype=mx.float32)  # start suppressed
+
+    def __call__(self, tokens: mx.array) -> mx.array:
+        """tokens: (B, T) int32 → (B, T, vocab_size) additive logit bias"""
+        B, T = tokens.shape
+        out = mx.zeros((B, T, self.table.weight.shape[1]), dtype=mx.float32)
+        gates = mx.sigmoid(self.skip_gate)
+
+        # Pattern 0: (t-1, t-3) → valid for t >= 3
+        if T > 3:
+            tm1 = tokens[:, 2:-1]   # t-1 for positions 3..T-1
+            tm3 = tokens[:, :-3]    # t-3 for positions 3..T-1
+            idx0 = mx.remainder(tm1 * self._PRIMES[0] + tm3, self.hash_size)
+            emb0 = self.table(idx0)                     # (B, T-3, vocab_size)
+            pad0 = mx.zeros((B, 3, emb0.shape[-1]), dtype=emb0.dtype)
+            emb0 = mx.concatenate([pad0, emb0], axis=1)
+            out = out + gates[0] * emb0.astype(mx.float32)
+
+        # Pattern 1: (t-1, t-5) → valid for t >= 5
+        if T > 5:
+            tm1 = tokens[:, 4:-1]   # t-1 for positions 5..T-1
+            tm5 = tokens[:, :-5]    # t-5 for positions 5..T-1
+            idx1 = mx.remainder(tm1 * self._PRIMES[1] + tm5, self.hash_size)
+            emb1 = self.table(idx1)                     # (B, T-5, vocab_size)
+            pad1 = mx.zeros((B, 5, emb1.shape[-1]), dtype=emb1.dtype)
+            emb1 = mx.concatenate([pad1, emb1], axis=1)
+            out = out + gates[1] * emb1.astype(mx.float32)
+
+        return out
+
+# ============================================================================
 # INNOVATION: SmearGate — blend each token embedding with previous token's
 # Technique: @unnir (PR #102/#135). Gate initialized to 3.0 → sigmoid≈0.95 pass-through.
 # ============================================================================
@@ -297,6 +469,47 @@ class EMABuffer:
 
     def state_dict(self):
         return dict(self.shadow)
+
+# ============================================================================
+# MOONSHOT: Complementary Training support
+# Module-level cache for bigram statistics used in complementary loss.
+# These are set by main() after loading training data.
+# ============================================================================
+_COMPLEMENT_BIGRAM_PROBS: "mx.array | None" = None   # (vocab, vocab) float32 probabilities
+_COMPLEMENT_ALPHA: float = 0.0                        # weighting strength (0 = disabled)
+# Floor weight ensures even n-gram-predictable tokens still train (prevents collapse)
+_MIN_COMPLEMENT_WEIGHT: float = 0.1
+# Numerical floor for probability mixing (prevents log(0) in n-gram mixer)
+_MIN_PROB: float = 1e-45
+
+
+def build_bigram_stats(data_pattern: str, vocab_size: int,
+                       log_fn=None) -> "np.ndarray | None":
+    """
+    Vectorised bigram probability table from the first training shard.
+    Uses np.bincount for speed (handles >100M tokens in <5 s).
+    Returns float32 array of shape (vocab_size, vocab_size): P(next | prev).
+    """
+    files = sorted(glob.glob(data_pattern))
+    if not files:
+        return None
+    try:
+        tokens = load_data_shard(Path(files[0]))   # fast: reads one shard
+    except Exception as exc:
+        if log_fn:
+            log_fn(f"bigram_stats_warning: {exc}")
+        return None
+
+    flat = (tokens[:-1].astype(np.int64) * vocab_size +
+            tokens[1:].astype(np.int64))
+    counts = np.bincount(flat, minlength=vocab_size * vocab_size).reshape(
+        vocab_size, vocab_size).astype(np.float64)
+    counts += 1.0  # Laplace smoothing
+    probs = (counts / counts.sum(axis=1, keepdims=True)).astype(np.float32)
+    if log_fn:
+        log_fn(f"bigram_stats_built: shard={Path(files[0]).name} "
+               f"tokens={tokens.size} vocab={vocab_size}")
+    return probs
 
 # ============================================================================
 # MODEL BLOCKS
@@ -414,7 +627,10 @@ class GPT(nn.Module):
                  mlp_mult, logit_chunk_tokens, logit_softcap, rope_base,
                  tied_embed_init_std, qk_gain_init, bigram_hash_size,
                  use_ortho_init, rope_dims: int = 0, xsa_last_n: int = 0,
-                 use_ln_scale: bool = True, smear_enabled: bool = True):
+                 use_ln_scale: bool = True, smear_enabled: bool = True,
+                 engram_lite_enabled: bool = False, engram_hash_size: int = 8192,
+                 engram_embed_dim: int = 256,
+                 engram_n_heads: int = 2, skipgram_hash_size: int = 0):
         super().__init__()
         self.logit_chunk_tokens = logit_chunk_tokens
         self.logit_softcap = logit_softcap
@@ -440,8 +656,23 @@ class GPT(nn.Module):
         ]
         self.final_norm = RMSNormNoWeight()
 
-        # INNOVATION: BigramHash on logits (None when bigram_hash_size=0)
-        self.bigram_hash = BigramHashEmbedding(bigram_hash_size, vocab_size) if bigram_hash_size > 0 else None
+        # N-gram hash logit bias: EngramLite (gated bigram+trigram) or plain BigramHash
+        # When engram_lite_enabled: use engram_hash_size (default 8192, multi-head → effective 2×8192)
+        # When plain BigramHash: use bigram_hash_size (default 16384, direct vocab-size table)
+        if bigram_hash_size > 0:
+            if engram_lite_enabled:
+                self.bigram_hash: "BigramHashEmbedding | EngramLiteEmbedding | None" = (
+                    EngramLiteEmbedding(engram_hash_size, vocab_size,
+                                        embed_dim=engram_embed_dim, n_heads=engram_n_heads))
+            else:
+                self.bigram_hash = BigramHashEmbedding(bigram_hash_size, vocab_size)
+        else:
+            self.bigram_hash = None
+
+        # Optional SkipGram hash logit bias
+        self.skipgram_hash: "SkipGramHashEmbedding | None" = (
+            SkipGramHashEmbedding(skipgram_hash_size, vocab_size)
+            if skipgram_hash_size > 0 else None)
 
         # Zero-init output projections
         for b in self.blocks:
@@ -472,6 +703,16 @@ class GPT(nn.Module):
         c = self.logit_softcap
         return c * mx.tanh(logits / c)
 
+    def _apply_hash_biases(self, logits: mx.array, input_ids: mx.array) -> mx.array:
+        """Apply bigram-hash and skip-gram logit biases (shared by loss + token_losses)."""
+        if self.bigram_hash is not None:
+            bias = self.bigram_hash(input_ids).reshape(-1, logits.shape[-1])
+            logits = logits + bias.astype(logits.dtype)
+        if self.skipgram_hash is not None:
+            sg_bias = self.skipgram_hash(input_ids).reshape(-1, logits.shape[-1])
+            logits = logits + sg_bias.astype(logits.dtype)
+        return logits
+
     def __call__(self, input_ids: mx.array) -> mx.array:
         x = rms_norm(self.tok_emb(input_ids).astype(COMPUTE_DTYPE))
         if self.smear is not None:
@@ -495,12 +736,18 @@ class GPT(nn.Module):
 
         logits = x @ self.tok_emb.weight.astype(x.dtype).T
         logits = self.softcap(logits)
+        logits = self._apply_hash_biases(logits, input_ids)
 
-        # Add BigramHash logit bias (skipped when bigram_hash is None)
-        if self.bigram_hash is not None:
-            bigram_bias = self.bigram_hash(input_ids)  # (B, T, vocab)
-            bigram_bias = bigram_bias.reshape(-1, bigram_bias.shape[-1])
-            logits = logits + bigram_bias.astype(logits.dtype)
+        # Complementary Training: down-weight tokens easily predicted by bigrams (#803)
+        # Weights are set by main() in _COMPLEMENT_BIGRAM_PROBS / _COMPLEMENT_ALPHA.
+        if _COMPLEMENT_ALPHA > 0 and _COMPLEMENT_BIGRAM_PROBS is not None:
+            # input_ids[b,t] is the context token whose bigram predicts target_ids[b,t]
+            context_tokens = input_ids.reshape(-1)
+            p_bigram = _COMPLEMENT_BIGRAM_PROBS[context_tokens, y]  # P(target | context) per pos
+            weights = mx.clip(1.0 - _COMPLEMENT_ALPHA * p_bigram, _MIN_COMPLEMENT_WEIGHT, 1.0)
+            weights = weights / weights.mean()
+            ce_per = nn.losses.cross_entropy(logits.astype(mx.float32), y, reduction="none")
+            return (ce_per * weights).mean()
 
         return nn.losses.cross_entropy(logits.astype(mx.float32), y, reduction="mean")
 
@@ -511,9 +758,7 @@ class GPT(nn.Module):
         y = target_ids.reshape(-1)
         logits = x @ self.tok_emb.weight.astype(x.dtype).T
         logits = self.softcap(logits)
-        if self.bigram_hash is not None:
-            bigram_bias = self.bigram_hash(input_ids).reshape(-1, self.tok_emb.weight.shape[0])
-            logits = logits + bigram_bias.astype(logits.dtype)
+        logits = self._apply_hash_biases(logits, input_ids)
         nll = nn.losses.cross_entropy(logits.astype(mx.float32), y, reduction="none")
         return nll.reshape(B, T)
 
@@ -551,16 +796,17 @@ class SplitOptimizers:
         self.args = args
         params = dict(tree_flatten(model.parameters()))
         self.embed_key = "tok_emb.weight"
+        _hash_prefixes = ("blocks.", "bigram_hash.", "skipgram_hash.")
         self.matrix_keys = [
             k for k, p in params.items()
-            if (k.startswith("blocks.") or k.startswith("bigram_hash."))
+            if any(k.startswith(pfx) for pfx in _hash_prefixes)
             and p.ndim == 2
             and not any(pat in k for pat in CONTROL_TENSOR_NAME_PATTERNS)
         ]
         self.scalar_keys = [
             k for k, p in params.items()
             if k == "skip_weights" or (
-                (k.startswith("blocks.") or k.startswith("bigram_hash."))
+                any(k.startswith(pfx) for pfx in _hash_prefixes)
                 and (p.ndim < 2 or any(pat in k for pat in CONTROL_TENSOR_NAME_PATTERNS))
             )
         ]
@@ -1077,6 +1323,212 @@ def eval_val_sliding_ttt(args, model, val_tokens,
 
 
 # ============================================================================
+# MOONSHOT: BackoffNgramMixer + eval_val_sliding_ngram
+#
+# BackoffNgramMixer: causal n-gram LM (unigram+bigram+trigram+4gram) built
+# incrementally from already-scored validation tokens (zero artifact cost).
+# Entropy-adaptive mixing with the neural model (#1094 approach).
+#
+# Two integration modes:
+#   1. ngram_from_train=True (default when bigram_stats available):
+#      Uses pre-built counts from training data.  Fast, fully vectorized.
+#   2. causal_update=True: sequential pass, updates cache from val tokens.
+#      Slower but potentially better for long sequences.
+# ============================================================================
+class BackoffNgramMixer:
+    """
+    Fast numpy n-gram language model for eval-time mixing.
+    Orders 1 (unigram) through max_order (default 4).
+    Bigram counts are exact (1024×1024 matrix); trigram/4gram use hashing.
+    Initialized with Laplace smoothing so every probability is > 0.
+    """
+    def __init__(self, vocab_size: int = 1024, max_order: int = 4,
+                 tri_hash_size: int = 8192):
+        self.vocab_size  = vocab_size
+        self.max_order   = max_order
+        self.tri_hash    = tri_hash_size
+
+        # Laplace-smoothed initial counts
+        self.uni   = np.ones(vocab_size, dtype=np.float64)
+        self.uni_n = float(vocab_size)
+
+        self.bi    = np.ones((vocab_size, vocab_size), dtype=np.float64)
+        self.bi_n  = np.full(vocab_size, float(vocab_size), dtype=np.float64)
+
+        if max_order >= 3:
+            self.tri   = np.ones((tri_hash_size, vocab_size), dtype=np.float64)
+            self.tri_n = np.full(tri_hash_size, float(vocab_size), dtype=np.float64)
+        if max_order >= 4:
+            self.quad   = np.ones((tri_hash_size, vocab_size), dtype=np.float64)
+            self.quad_n = np.full(tri_hash_size, float(vocab_size), dtype=np.float64)
+
+    # ------------------------------------------------------------------
+    # Seed from pre-built numpy counts (fast: vectorised training stats)
+    # ------------------------------------------------------------------
+    def seed_from_bigram_probs(self, bigram_probs_np: np.ndarray) -> None:
+        """Seed bigram table from a (vocab, vocab) probability matrix."""
+        # Convert probs back to pseudo-counts proportional to the probability
+        # (multiply so that each row sums to vocab_size → same as Laplace init scale)
+        self.bi   = bigram_probs_np.astype(np.float64) * self.vocab_size
+        self.bi_n = self.bi.sum(axis=1)
+
+    # ------------------------------------------------------------------
+    # Per-token get_prob (causal: context is already observed tokens)
+    # ------------------------------------------------------------------
+    def get_prob(self, ctx: list, target: int) -> float:
+        """Interpolated n-gram probability P(target | ctx[-order+1:])."""
+        target = int(target)
+        p = self.uni[target] / self.uni_n
+
+        if len(ctx) >= 1:
+            prev = int(ctx[-1])
+            bn = self.bi_n[prev]
+            lam = bn / (bn + 5.0)
+            p = (1 - lam) * p + lam * (self.bi[prev, target] / bn)
+
+        if self.max_order >= 3 and len(ctx) >= 2:
+            h = int((int(ctx[-2]) * 31337 + int(ctx[-1])) % self.tri_hash)
+            tn = self.tri_n[h]
+            lam = tn / (tn + 5.0)
+            p = (1 - lam) * p + lam * (self.tri[h, target] / tn)
+
+        if self.max_order >= 4 and len(ctx) >= 3:
+            h = int((int(ctx[-3]) * 31337 * 31337 +
+                     int(ctx[-2]) * 31337 +
+                     int(ctx[-1])) % self.tri_hash)
+            qn = self.quad_n[h]
+            lam = qn / (qn + 5.0)
+            p = (1 - lam) * p + lam * (self.quad[h, target] / qn)
+
+        return max(p, _MIN_PROB)
+
+    def update(self, ctx: list, token: int) -> None:
+        """Causal update: add (ctx → token) to all applicable count tables."""
+        t = int(token)
+        self.uni[t]   += 1.0
+        self.uni_n    += 1.0
+        if len(ctx) >= 1:
+            prev = int(ctx[-1])
+            self.bi[prev, t]  += 1.0
+            self.bi_n[prev]   += 1.0
+        if self.max_order >= 3 and len(ctx) >= 2:
+            h = int((int(ctx[-2]) * 31337 + int(ctx[-1])) % self.tri_hash)
+            self.tri[h, t]    += 1.0
+            self.tri_n[h]     += 1.0
+        if self.max_order >= 4 and len(ctx) >= 3:
+            h = int((int(ctx[-3]) * 31337 * 31337 +
+                     int(ctx[-2]) * 31337 +
+                     int(ctx[-1])) % self.tri_hash)
+            self.quad[h, t]   += 1.0
+            self.quad_n[h]    += 1.0
+
+
+def eval_val_sliding_ngram(args, model, val_tokens,
+                           base_bytes_lut, has_leading_space_lut,
+                           is_boundary_token_lut,
+                           bigram_probs_np: "np.ndarray | None" = None,
+                           log_fn=None):
+    """
+    Sliding-window eval + BackoffNgramMixer.
+
+    Phase 1: Run standard sliding-window eval, storing per-absolute-position NLL.
+    Phase 2: Sequential causal n-gram pass over val_tokens.
+    Phase 3: Mix distributions and compute final BPB.
+
+    If bigram_probs_np is provided, the n-gram model is seeded with training-data
+    bigram statistics (fast, still causal since training data ≠ validation data).
+    The causal sequential update then further refines with validation context.
+    """
+    seq_len    = args.eval_seq_len
+    stride     = args.eval_stride
+    batch_seqs = args.eval_batch_seqs
+    total_tokens = val_tokens.size - 1
+
+    window_starts = [ws for ws in range(0, total_tokens, stride)
+                     if min(ws + seq_len, total_tokens) - ws >= 1]
+    total_windows = len(window_starts)
+
+    # --- Phase 1: Neural NLL per absolute position ---
+    pos_nll      = np.full(total_tokens, np.inf, dtype=np.float64)
+    x_ref_np     = np.zeros(total_tokens, dtype=np.int32)   # prev token at each pos
+    y_ref_np     = np.zeros(total_tokens, dtype=np.int32)   # target token at each pos
+
+    model.use_qat = False
+    for bi_idx in range(0, total_windows, batch_seqs):
+        batch_ws = window_starts[bi_idx:bi_idx + batch_seqs]
+        bsz = len(batch_ws)
+
+        x_np = np.zeros((bsz, seq_len), dtype=np.int32)
+        y_np = np.zeros((bsz, seq_len), dtype=np.int32)
+        wlens: list[int] = []
+        for i, ws in enumerate(batch_ws):
+            end  = min(ws + seq_len, total_tokens)
+            wlen = end - ws
+            wlens.append(wlen)
+            x_np[i, :wlen] = val_tokens[ws:end]
+            y_np[i, :wlen] = val_tokens[ws + 1:end + 1]
+
+        nll = model.token_losses(mx.array(x_np), mx.array(y_np))
+        mx.eval(nll)
+        nll_np = np.array(nll)
+
+        for i, ws in enumerate(batch_ws):
+            wlen  = wlens[i]
+            s     = 0 if ws == 0 else max(wlen - stride, 0)
+            abs_s = ws + s
+            abs_e = ws + wlen
+            pos_nll  [abs_s:abs_e] = nll_np[i, s:wlen]
+            x_ref_np [abs_s:abs_e] = x_np[i, s:wlen]
+            y_ref_np [abs_s:abs_e] = y_np[i, s:wlen]
+
+        if log_fn and (bi_idx // batch_seqs) % 50 == 0:
+            done = min(bi_idx + batch_seqs, total_windows)
+            log_fn(f"ngram_eval_phase1 [{done/total_windows*100:5.1f}%] "
+                   f"{done}/{total_windows} windows")
+
+    # --- Phase 2 & 3: N-gram scoring + mixing ---
+    ngram = BackoffNgramMixer(vocab_size=args.vocab_size,
+                              max_order=args.ngram_max_order)
+    if bigram_probs_np is not None:
+        ngram.seed_from_bigram_probs(bigram_probs_np)
+
+    alpha     = args.ngram_alpha
+    loss_sum  = 0.0
+    tok_count = 0.0
+    byte_count = 0.0
+
+    for t in range(total_tokens):
+        target = int(val_tokens[t + 1])
+        # Build context [val_tokens[t-(order-1)], ..., val_tokens[t-1], val_tokens[t]]
+        # so that ctx[-1] = val_tokens[t] → bigram predicts P(target | val_tokens[t])
+        ctx = [int(val_tokens[max(0, t - k)]) for k in range(args.ngram_max_order - 1, -1, -1)]
+
+        if pos_nll[t] < np.inf:
+            p_neural = float(np.exp(-pos_nll[t]))
+            p_ngram  = ngram.get_prob(ctx, target)
+            nll_mix  = -math.log(max((1.0 - alpha) * p_neural + alpha * p_ngram, _MIN_PROB))
+            loss_sum  += nll_mix
+            tok_count += 1.0
+            prev = int(x_ref_np[t])
+            tgt  = int(y_ref_np[t])
+            bc   = float(base_bytes_lut[tgt])
+            bc  += float(has_leading_space_lut[tgt] and not is_boundary_token_lut[prev])
+            byte_count += bc
+
+        # Causal update — AFTER scoring
+        ngram.update(ctx, target)
+
+        if log_fn and t > 0 and t % 100_000 == 0:
+            pct  = t / total_tokens * 100
+            rbpb = (loss_sum / max(tok_count, 1)) / math.log(2.0) * (tok_count / max(byte_count, 1))
+            log_fn(f"ngram_eval_phase2 [{pct:5.1f}%] {t}/{total_tokens} bpb={rbpb:.4f}")
+
+    val_loss = loss_sum / tok_count
+    val_bpb  = (val_loss / math.log(2.0)) * (tok_count / byte_count)
+    return val_loss, val_bpb
+
+
+# ============================================================================
 # MAIN
 # ============================================================================
 def main():
@@ -1100,6 +1552,16 @@ def main():
     val_tokens = load_validation_tokens(args.val_files, args.train_seq_len)
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(sp, args.vocab_size)
 
+    # ---- Complementary Training: build bigram stats from first training shard ----
+    _bigram_probs_np = None
+    if args.complement_alpha > 0.0 or args.ngram_mixer_enabled:
+        _bigram_probs_np = build_bigram_stats(args.train_files, args.vocab_size, log_fn=log)
+    if args.complement_alpha > 0.0 and _bigram_probs_np is not None:
+        global _COMPLEMENT_BIGRAM_PROBS, _COMPLEMENT_ALPHA
+        _COMPLEMENT_BIGRAM_PROBS = mx.array(_bigram_probs_np, dtype=mx.float32)
+        _COMPLEMENT_ALPHA = args.complement_alpha
+        log(f"complement_training: alpha={_COMPLEMENT_ALPHA}")
+
     mx.random.seed(args.seed)
     train_loader = TokenLoader(args.train_files, log_fn=log, dataset_name=dataset_name)
 
@@ -1112,6 +1574,10 @@ def main():
         use_ortho_init=args.use_ortho_init,
         rope_dims=args.rope_dims, xsa_last_n=args.xsa_last_n,
         use_ln_scale=args.ln_scale_enabled, smear_enabled=args.smear_enabled,
+        engram_lite_enabled=args.engram_lite_enabled,
+        engram_hash_size=args.engram_hash_size,
+        engram_embed_dim=args.engram_embed_dim, engram_n_heads=args.engram_n_heads,
+        skipgram_hash_size=args.skipgram_hash_size,
     )
     opt = SplitOptimizers(model, args)
 
@@ -1136,6 +1602,11 @@ def main():
         f"ln_scale={args.ln_scale_enabled} xsa_last_n={args.xsa_last_n} xsa_layers={xsa_layers} "
         f"gptq_lite={args.use_gptq_lite} ttt={args.ttt_enabled} eval_mode={args.eval_mode} "
         f"use_swa={args.use_swa} swa_decay={args.swa_decay}")
+    log(f"moonshot: engram_lite={args.engram_lite_enabled} engram_hash={args.engram_hash_size} "
+        f"engram_dim={args.engram_embed_dim} engram_heads={args.engram_n_heads} "
+        f"skipgram={args.skipgram_hash_size} complement_alpha={args.complement_alpha} "
+        f"ngram_mixer={args.ngram_mixer_enabled} ngram_order={args.ngram_max_order} "
+        f"ngram_alpha={args.ngram_alpha}")
     log(f"iterations:{args.iterations} train_batch_tokens:{args.train_batch_tokens} "
         f"grad_accum:{args.grad_accum_steps} seq_len:{args.train_seq_len}")
     log(f"optimizer: muon_keys:{len(opt.matrix_keys)} scalar_keys:{len(opt.scalar_keys)}")
@@ -1319,6 +1790,14 @@ def main():
             log(f"final_eval_mode:ttt_sliding rank:{args.ttt_rank} lr:{args.ttt_lr} steps:{args.ttt_steps} stride:{args.eval_stride}")
             q_val_loss, q_val_bpb = eval_val_sliding_ttt(args, model, val_tokens,
                 base_bytes_lut, has_leading_space_lut, is_boundary_token_lut, log_fn=log)
+        elif args.ngram_mixer_enabled:
+            log(f"final_eval_mode:sliding_ngram order:{args.ngram_max_order} alpha:{args.ngram_alpha} "
+                f"eval_seq_len:{args.eval_seq_len} stride:{args.eval_stride} "
+                f"bigram_seeded:{_bigram_probs_np is not None}")
+            q_val_loss, q_val_bpb = eval_val_sliding_ngram(
+                args, model, val_tokens,
+                base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+                bigram_probs_np=_bigram_probs_np, log_fn=log)
         else:
             log(f"final_eval_mode:sliding_window eval_seq_len:{args.eval_seq_len} stride:{args.eval_stride} batch_seqs:{args.eval_batch_seqs}")
             q_val_loss, q_val_bpb = eval_val_sliding(args, model, val_tokens,
