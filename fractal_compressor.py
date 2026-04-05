@@ -151,13 +151,12 @@ class SequenceFolder(nn.Module):
         super().__init__()
         # 1D conv: groups=1, kernel_size=2, stride=2 — learned weighted average of adjacent tokens
         self.conv = nn.Conv1d(dim, dim, kernel_size=2, stride=2, bias=False)
-        # Initialize close to simple averaging
-        nn.init.constant_(self.conv.weight, 0.0)
+        # Initialize close to simple averaging (vectorized)
         with torch.no_grad():
-            # Each output channel averages its two input positions
-            for i in range(dim):
-                self.conv.weight[i, i, 0] = 0.5
-                self.conv.weight[i, i, 1] = 0.5
+            self.conv.weight.zero_()
+            diag_idx = torch.arange(dim)
+            self.conv.weight[diag_idx, diag_idx, 0] = 0.5
+            self.conv.weight[diag_idx, diag_idx, 1] = 0.5
         self.norm = nn.LayerNorm(dim)
 
     def forward(self, x: Tensor) -> Tensor:
@@ -334,6 +333,7 @@ class FractalCompressor(nn.Module):
         logit_softcap:  Logit soft-capping value.
         spectral_rank_frac: Rank fraction for SpectralLinear in SharedProjector.
         vocab_size:     Output vocabulary size (for the LM head).
+        shared_proj_scale: Scale factor for the shared projector residual signal.
     """
 
     def __init__(
@@ -349,12 +349,14 @@ class FractalCompressor(nn.Module):
         logit_softcap: float = 30.0,
         spectral_rank_frac: float = 0.3,
         vocab_size: int = 1024,
+        shared_proj_scale: float = 0.1,
     ):
         super().__init__()
         self.num_iterations = num_iterations
         self.logit_softcap = logit_softcap
         self.vocab_size = vocab_size
         self.model_dim = model_dim
+        self.shared_proj_scale = shared_proj_scale
 
         # 1. Byte-level embeddings + assembler
         self.assembler = ByteAssembler(byte_dim=byte_dim, model_dim=model_dim)
@@ -398,7 +400,7 @@ class FractalCompressor(nn.Module):
 
         # Inject shared projector output as an additive signal
         shared_signal = self.shared_proj.forward_a(x)
-        x = x + 0.1 * shared_signal  # small residual from shared Q-path
+        x = x + self.shared_proj_scale * shared_signal
 
         # Recurrent loop with dynamic sequence folding
         for i in range(self.num_iterations):
@@ -406,9 +408,9 @@ class FractalCompressor(nn.Module):
 
         # LM head
         x = self.final_norm(x)
-        # After folding, sequence may be shorter than targets — we need to
-        # handle the case where folding reduced the sequence length.
-        # For training, we align by truncating targets to match.
+        # After folding, sequence may be shorter than targets.
+        # Truncate targets to match — later positions are folded into earlier ones,
+        # so the model learns to compress information during folding.
         L_out = x.size(1)
         L_tgt = target_ids.size(1)
 
@@ -428,7 +430,7 @@ class FractalCompressor(nn.Module):
         x = self.assembler(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         shared_signal = self.shared_proj.forward_a(x)
-        x = x + 0.1 * shared_signal
+        x = x + self.shared_proj_scale * shared_signal
         for i in range(self.num_iterations):
             x = self.recurrent_block(x, i)
         x = self.final_norm(x)
