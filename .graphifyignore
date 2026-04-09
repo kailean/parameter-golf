@@ -1,0 +1,12 @@
+graphify-env/
+graphify-out/
+data/
+records/
+logs/
+.git/
+__pycache__/
+*.pyc
+*.npz
+*.bin
+*.safetensors
+*.gguf
