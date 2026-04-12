@@ -90,7 +90,7 @@ def train():
         "MODEL_DIM": "512",
         "NUM_HEADS": "8",
         "NUM_KV_HEADS": "4",
-        "MLP_MULT": "4",
+        "MLP_MULT": "3",
         "TIE_EMBEDDINGS": "1",
         "TIED_EMBED_INIT_STD": "0.005",
         "QK_GAIN_INIT": "5.25",
