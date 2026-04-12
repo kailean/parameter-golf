@@ -1497,6 +1497,8 @@ def main() -> None:
             step_ms_avg = training_time_ms / step
             est_total   = min(args.iterations, int(max_wallclock_ms / max(step_ms_avg, 1e-6)))
 
+        scale = lr_mul(step, elapsed_ms)
+
         # Toggle QAT when lr_mul drops below late_qat_threshold (warmdown-triggered)
         if not use_qat_active and scale < args.late_qat_threshold:
             use_qat_active = True
@@ -1519,7 +1521,6 @@ def main() -> None:
             swa = EMABuffer(base_model, decay=args.swa_decay)
             log0(f"swa_started:step={step} decay={args.swa_decay}")
 
-        scale = lr_mul(step, elapsed_ms)
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
