@@ -1500,7 +1500,8 @@ def main() -> None:
         scale = lr_mul(step, elapsed_ms)
 
         # Toggle QAT when lr_mul drops below late_qat_threshold (warmdown-triggered)
-        if not use_qat_active and scale < args.late_qat_threshold:
+        # Only check after warmup completes to avoid triggering during warmup ramp
+        if not use_qat_active and step > args.warmup_steps and scale < args.late_qat_threshold:
             use_qat_active = True
             for m in base_model.modules():
                 if isinstance(m, CastedLinear):
