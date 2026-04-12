@@ -27,6 +27,7 @@ import time
 import uuid
 import zlib
 import zstandard
+import brotli
 from pathlib import Path
 
 import numpy as np
@@ -1715,27 +1716,38 @@ def main() -> None:
     quant_obj_int6, quant_stats_int6 = quantize_state_dict_int6(base_model.state_dict(), use_gptq_lite=args.use_gptq_lite)
     quant_buf_int6 = io.BytesIO()
     torch.save(quant_obj_int6, quant_buf_int6)
-    quant_blob_int6 = zstandard.ZstdCompressor(level=22).compress(quant_buf_int6.getvalue())
+    quant_raw_int6 = quant_buf_int6.getvalue()
+
+    # ── int6+brotli (competition-winning format, smallest) ──
+    quant_blob_int6_brotli = brotli.compress(quant_raw_int6, quality=11)
 
     if master_process:
-        with open("final_model.int6.ptz", "wb") as f:
-            f.write(quant_blob_int6)
-        int6_bytes = os.path.getsize("final_model.int6.ptz")
+        with open("final_model.int6.brotli.ptz", "wb") as f:
+            f.write(quant_blob_int6_brotli)
+        int6_brotli_bytes = os.path.getsize("final_model.int6.brotli.ptz")
         code_bytes = len(code.encode("utf-8"))
         ratio_int6 = quant_stats_int6["baseline_tensor_bytes"] / max(quant_stats_int6["int6_payload_bytes"], 1)
         log0(
-            f"serialized_int6_zstd:{int6_bytes} bytes "
+            f"serialized_int6_brotli:{int6_brotli_bytes} bytes "
             f"(payload:{quant_stats_int6['int6_payload_bytes']} ratio:{ratio_int6:.2f}x)"
         )
-        log0(f"Total submission size int6+zstd: {int6_bytes + code_bytes} bytes")
+        log0(f"Total submission size int6+brotli: {int6_brotli_bytes + code_bytes} bytes")
+
+        # Also save int6+zstd for comparison
+        quant_blob_int6_zstd = zstandard.ZstdCompressor(level=22).compress(quant_raw_int6)
+        with open("final_model.int6.ptz", "wb") as f:
+            f.write(quant_blob_int6_zstd)
+        int6_zstd_bytes = os.path.getsize("final_model.int6.ptz")
+        log0(f"serialized_int6_zstd:{int6_zstd_bytes} bytes (comparison)")
+        log0(f"Total submission size int6+zstd: {int6_zstd_bytes + code_bytes} bytes (comparison)")
 
     if distributed:
         dist.barrier()
-    # Load and roundtrip the int8+zlib model (competition format)
-    with open("final_model.int8.ptz", "rb") as f:
+    # Load and roundtrip the int6+brotli model (competition format)
+    with open("final_model.int6.brotli.ptz", "rb") as f:
         quant_blob_disk = f.read()
-    quant_state = torch.load(io.BytesIO(zlib.decompress(quant_blob_disk)), map_location="cpu", weights_only=False)
-    base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
+    quant_state = torch.load(io.BytesIO(brotli.decompress(quant_blob_disk)), map_location="cpu", weights_only=False)
+    base_model.load_state_dict(dequantize_state_dict_int6(quant_state), strict=True)
 
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
@@ -1763,10 +1775,10 @@ def main() -> None:
         )
     torch.cuda.synchronize()
     log0(
-        f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
+        f"final_int6_brotli_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
     )
-    log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+    log0(f"final_int6_brotli_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
 
     if distributed:
         dist.destroy_process_group()

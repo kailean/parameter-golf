@@ -21,6 +21,7 @@ image = (
         "triton",
         "huggingface_hub",
         "zstandard",
+        "brotli",
     )
     .run_commands("git lfs install")
 )
