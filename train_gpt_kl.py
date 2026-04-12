@@ -79,7 +79,7 @@ class Hyperparameters:
     # KL innovations
     bigram_hash_size = int(os.environ.get("BIGRAM_HASH_SIZE", 16384))
     qat_start_frac   = float(os.environ.get("QAT_START_FRAC", 0.15))  # UNUSED — late_qat_threshold controls QAT
-    ema_decay        = float(os.environ.get("EMA_DECAY", 0.995))
+    ema_decay        = float(os.environ.get("EMA_DECAY", 0.9965))
     ema_start_frac   = float(os.environ.get("EMA_START_FRAC", 0.5))
     use_ortho_init   = bool(int(os.environ.get("USE_ORTHO_INIT", "1")))
     # SWA — optional complement/replacement for EMA; starts at 60% of iterations
@@ -97,6 +97,23 @@ class Hyperparameters:
     # SOTA reinjects token identity into attention values at specific late layers via a
     # shared low-dim embedding (ve_dim=128) projected to kv_dim, added as v_embed to V.
     # Applied at layers 9,10 with per-layer learned scales.
+
+    # Depth Recurrence
+    depth_recurrence  = bool(int(os.environ.get("DEPTH_RECURRENCE", "1")))
+    recurrence_layers = [int(x) for x in os.environ.get("RECURRENCE_LAYERS", "3,4,5").split(",") if x.strip()]
+    recurrence_loops  = int(os.environ.get("RECURRENCE_LOOPS", "2"))
+
+    # Parallel Residuals (GPT-J style)
+    parallel_residuals   = bool(int(os.environ.get("PARALLEL_RESIDUALS", "1")))
+    parallel_res_start   = int(os.environ.get("PARALLEL_RES_START", "7"))
+
+    # TTT (Test-Time Training)
+    ttt_enabled        = bool(int(os.environ.get("TTT_ENABLED", "1")))
+    ttt_rank           = int(os.environ.get("TTT_RANK", "4"))
+    ttt_lr             = float(os.environ.get("TTT_LR", "0.001"))
+    ttt_steps          = int(os.environ.get("TTT_STEPS", "3"))
+    ttt_entropy_weight = float(os.environ.get("TTT_ENTROPY_WEIGHT", "1.0"))
+    ttt_doc_independent = bool(int(os.environ.get("TTT_DOC_INDEPENDENT", "1")))
 
     # Optimizer
     embed_lr        = float(os.environ.get("EMBED_LR", 0.6))
@@ -501,6 +518,191 @@ def eval_val_sliding(
     return val_loss, bits_per_token * tokens_per_byte
 
 
+def eval_val_sliding_ttt(
+    args: Hyperparameters,
+    model: nn.Module,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+    val_tokens: Tensor,
+    base_bytes_lut: Tensor,
+    has_leading_space_lut: Tensor,
+    is_boundary_token_lut: Tensor,
+    stride: int,
+    seq_len: int,
+    batch_seqs: int = 32,
+) -> tuple[float, float]:
+    """Sliding-window eval with entropy-weighted LoRA TTT (score-first, per-document).
+
+    For each validation window:
+    1. Create low-rank LoRA adapters on Q and V projections.
+    2. Run TTT_STEPS gradient steps on the prefix, weighted by predictive entropy.
+    3. Compute final loss on the full window with adapted model.
+    4. Reset LoRA (if TTT_DOC_INDEPENDENT).
+    """
+    total_tokens  = val_tokens.numel() - 1
+    window_starts = [ws for ws in range(0, total_tokens, stride)
+                     if min(ws + seq_len, total_tokens) - ws >= 1]
+    total_windows = len(window_starts)
+    my_s = (total_windows * rank) // world_size
+    my_e = (total_windows * (rank + 1)) // world_size
+    my_windows = window_starts[my_s:my_e]
+
+    loss_sum    = torch.zeros((), device=device, dtype=torch.float64)
+    token_count = torch.zeros((), device=device, dtype=torch.float64)
+    byte_count  = torch.zeros((), device=device, dtype=torch.float64)
+
+    base_model = model.module if isinstance(model, DDP) else model
+    base_model.eval()
+
+    # Collect Q and V weight matrices for LoRA
+    qv_pairs: list[tuple[str, str, int, int]] = []  # (q_name, v_name, out_f, in_f)
+    for block in base_model.blocks:
+        q_w = block.attn.c_q.weight  # (dim, dim)
+        v_w = block.attn.c_v.weight  # (kv_dim, dim)
+        qv_pairs.append((block.attn.c_q.weight, block.attn.c_v.weight))
+
+    ttt_rank = args.ttt_rank
+    ttt_lr   = args.ttt_lr
+    ttt_steps = args.ttt_steps
+    ent_weight = args.ttt_entropy_weight
+    max_ent = math.log(args.vocab_size)  # max possible entropy
+
+    # Create per-window LoRA adapters
+    def create_lora_adapters():
+        adapters = []
+        for q_w, v_w in qv_pairs:
+            out_f_q, in_f_q = q_w.shape
+            out_f_v, in_f_v = v_w.shape
+            a_q = torch.randn(out_f_q, ttt_rank, device=device, dtype=torch.bfloat16) * 0.01
+            b_q = torch.zeros(ttt_rank, in_f_q, device=device, dtype=torch.bfloat16)
+            a_v = torch.randn(out_f_v, ttt_rank, device=device, dtype=torch.bfloat16) * 0.01
+            b_v = torch.zeros(ttt_rank, in_f_v, device=device, dtype=torch.bfloat16)
+            adapters.append((a_q, b_q, a_v, b_v))
+        return adapters
+
+    def apply_lora(adapters):
+        """Monkey-patch LoRA into Q/V forward passes. Returns originals for restoration."""
+        originals = []
+        for i, (block, (a_q, b_q, a_v, b_v)) in enumerate(zip(base_model.blocks, adapters)):
+            orig_q_fwd = block.attn.c_q.forward
+            orig_v_fwd = block.attn.c_v.forward
+            w_q = block.attn.c_q.weight
+            w_v = block.attn.c_v.weight
+
+            def make_lora_forward(w, a, b, orig_fwd):
+                def lora_forward(x):
+                    return F.linear(x, w.to(x.dtype), None) + (x @ b.T.to(x.dtype)) @ a.T.to(x.dtype)
+                return lora_forward
+
+            block.attn.c_q.forward = make_lora_forward(w_q, a_q, b_q, orig_q_fwd)
+            block.attn.c_v.forward = make_lora_forward(w_v, a_v, b_v, orig_v_fwd)
+            originals.append((i, orig_q_fwd, orig_v_fwd))
+        return originals
+
+    def restore_lora(originals):
+        for i, orig_q_fwd, orig_v_fwd in originals:
+            base_model.blocks[i].attn.c_q.forward = orig_q_fwd
+            base_model.blocks[i].attn.c_v.forward = orig_v_fwd
+
+    # Process windows with TTT
+    with torch.inference_mode(False):  # Need grad for TTT
+        for bi in range(0, len(my_windows), batch_seqs):
+            batch_ws = my_windows[bi:bi + batch_seqs]
+            bsz = len(batch_ws)
+            x_batch = torch.zeros(bsz, seq_len, dtype=torch.int64, device=device)
+            y_batch = torch.zeros(bsz, seq_len, dtype=torch.int64, device=device)
+            wlens: list[int] = []
+            for i, ws in enumerate(batch_ws):
+                end  = min(ws + seq_len, total_tokens)
+                wlen = end - ws
+                wlens.append(wlen)
+                chunk = val_tokens[ws:end + 1].to(dtype=torch.int64, device=device)
+                x_batch[i, :wlen] = chunk[:-1]
+                y_batch[i, :wlen] = chunk[1:]
+
+            # Create fresh LoRA adapters for this batch
+            if args.ttt_doc_independent:
+                adapters = create_lora_adapters()
+            # Make LoRA params require grad
+            lora_params = []
+            for a_q, b_q, a_v, b_v in adapters:
+                a_q.requires_grad_(True); b_q.requires_grad_(True)
+                a_v.requires_grad_(True); b_v.requires_grad_(True)
+                lora_params.extend([a_q, b_q, a_v, b_v])
+
+            # Apply LoRA
+            originals = apply_lora(adapters)
+
+            # TTT: gradient steps on prefix tokens
+            prefix_len = max(seq_len // 4, 1)  # Use first 25% as TTT prefix
+            for ttt_step in range(ttt_steps):
+                with torch.enable_grad():
+                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                        logits = base_model.forward_logits(x_batch[:, :prefix_len])
+                    log_probs = F.log_softmax(logits.float(), dim=-1)
+                    # Gather log probs for target tokens
+                    tgt = y_batch[:, :prefix_len]
+                    log_prob = log_probs.gather(-1, tgt.unsqueeze(-1)).squeeze(-1)  # (B, T_prefix)
+                    # Compute entropy of prediction distribution
+                    probs = torch.exp(log_probs)
+                    entropy = -(probs * log_probs).sum(dim=-1)  # (B, T_prefix)
+                    entropy_normalized = entropy / max_ent  # [0, 1]
+                    # Entropy-weighted loss: uncertain positions get larger gradients
+                    loss = (-log_prob * (1.0 + ent_weight * entropy_normalized)).mean()
+                # Gradient step
+                grads = torch.autograd.grad(loss, lora_params)
+                for p, g in zip(lora_params, grads):
+                    p.data -= ttt_lr * g
+
+            # Score full window with adapted model
+            with torch.no_grad():
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    logits = base_model.forward_logits(x_batch)  # (B, T, vocab)
+                nll = F.cross_entropy(
+                    logits.reshape(-1, logits.size(-1)).float(),
+                    y_batch.reshape(-1),
+                    reduction="none",
+                ).reshape(bsz, seq_len)
+
+            # Restore original forwards
+            restore_lora(originals)
+
+            for i, ws in enumerate(batch_ws):
+                wlen = wlens[i]
+                s    = 0 if ws == 0 else max(wlen - stride, 0)
+                loss_sum    += nll[i, s:wlen].to(torch.float64).sum()
+                token_count += float(wlen - s)
+                tgt  = y_batch[i, s:wlen]
+                prev = x_batch[i, s:wlen]
+                tb   = base_bytes_lut[tgt].to(torch.float64)
+                tb  += (has_leading_space_lut[tgt] & ~is_boundary_token_lut[prev]).to(torch.float64)
+                byte_count += tb.sum()
+
+            if not args.ttt_doc_independent:
+                # Keep adapters across documents
+                pass
+
+            if rank == 0 and (bi // batch_seqs) % 50 == 0:
+                done = min(bi + batch_seqs, len(my_windows))
+                pct  = done / len(my_windows) * 100
+                rbpb = 0.0
+                if token_count.item() > 0:
+                    rbpb = (loss_sum / token_count).item() / math.log(2.0) * (token_count.item() / byte_count.item())
+                print(f"  sliding_eval_ttt [{pct:5.1f}%] {done}/{len(my_windows)} windows running_bpb={rbpb:.6f}", flush=True)
+
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(loss_sum,    op=dist.ReduceOp.SUM)
+        dist.all_reduce(token_count, op=dist.ReduceOp.SUM)
+        dist.all_reduce(byte_count,  op=dist.ReduceOp.SUM)
+
+    val_loss        = (loss_sum / token_count).item()
+    bits_per_token  = val_loss / math.log(2.0)
+    tokens_per_byte = token_count.item() / byte_count.item()
+    base_model.train()
+    return val_loss, bits_per_token * tokens_per_byte
+
+
 # ─────────────────────────────────────────────────────────────
 # POST-TRAINING QUANTIZATION  (int6 packed + zstandard)
 # ─────────────────────────────────────────────────────────────
@@ -877,12 +1079,18 @@ class Block(nn.Module):
         # 1/sqrt(layer+1) depth scale — dampens deep layer activations (ln_scale)
         self.ln_scale_factor = float(1.0 / math.sqrt(layer_idx + 1)) if use_ln_scale else 1.0
 
-    def forward(self, x: Tensor, x0: Tensor) -> Tensor:
+    def forward(self, x: Tensor, x0: Tensor, parallel_residual: bool = False) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
         x   = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         s   = self.ln_scale_factor
-        x   = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * self.attn(self.attn_norm(x) * s)
-        x   = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :]  * self.mlp(self.mlp_norm(x) * s)
+        if parallel_residual:
+            # GPT-J / PaLM style: attention and MLP in parallel
+            x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * self.attn(self.attn_norm(x) * s) \
+                   + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x) * s)
+        else:
+            # Standard sequential: attention then MLP
+            x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * self.attn(self.attn_norm(x) * s)
+            x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :]  * self.mlp(self.mlp_norm(x) * s)
         return x
 
 
@@ -906,11 +1114,21 @@ class GPT(nn.Module):
         xsa_last_n: int = 0,
         rope_dims: int = 0,
         ln_scale_enabled: bool = True,
+        depth_recurrence: bool = False,
+        recurrence_layers: list[int] | None = None,
+        recurrence_loops: int = 2,
+        parallel_residuals: bool = False,
+        parallel_res_start: int = 7,
     ):
         super().__init__()
         self.tie_embeddings     = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap      = logit_softcap
+        self.depth_recurrence   = depth_recurrence
+        self.recurrence_layers  = recurrence_layers if recurrence_layers is not None else []
+        self.recurrence_loops   = recurrence_loops
+        self.parallel_residuals = parallel_residuals
+        self.parallel_res_start = parallel_res_start
 
         self.tok_emb            = nn.Embedding(vocab_size, model_dim)
         self.num_encoder_layers = num_layers // 2
@@ -952,22 +1170,35 @@ class GPT(nn.Module):
                 for linear in [block.attn.c_q, block.attn.c_k, block.attn.c_v, block.mlp.fc]:
                     nn.init.orthogonal_(linear.weight, gain=0.5)
 
+    def _run_blocks(self, x: Tensor, x0: Tensor) -> Tensor:
+        """Run all blocks with depth recurrence and parallel residuals support."""
+        skips: list[Tensor] = []
+        for i in range(self.num_encoder_layers):
+            par = self.parallel_residuals and i >= self.parallel_res_start
+            x = self.blocks[i](x, x0, parallel_residual=par)
+            skips.append(x)
+        for i in range(self.num_decoder_layers):
+            if skips:
+                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+            bi = self.num_encoder_layers + i
+            par = self.parallel_residuals and bi >= self.parallel_res_start
+            x = self.blocks[bi](x, x0, parallel_residual=par)
+        # Depth recurrence: re-run specified layers additional times
+        if self.depth_recurrence and self.recurrence_layers and self.recurrence_loops > 1:
+            for _ in range(self.recurrence_loops - 1):
+                for li in self.recurrence_layers:
+                    if li < len(self.blocks):
+                        par = self.parallel_residuals and li >= self.parallel_res_start
+                        x = self.blocks[li](x, x0, parallel_residual=par)
+        return x
+
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x  = self.tok_emb(input_ids)
         x  = F.rms_norm(x, (x.size(-1),))
         if self.smear is not None:
             x = self.smear(x)
         x0 = x
-        skips: list[Tensor] = []
-
-        for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
-            skips.append(x)
-        for i in range(self.num_decoder_layers):
-            if skips:
-                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
-
+        x = self._run_blocks(x, x0)
         x       = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
 
@@ -992,14 +1223,7 @@ class GPT(nn.Module):
         if self.smear is not None:
             x = self.smear(x)
         x0 = x
-        skips: list[Tensor] = []
-        for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
-            skips.append(x)
-        for i in range(self.num_decoder_layers):
-            if skips:
-                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+        x = self._run_blocks(x, x0)
         x = self.final_norm(x)  # (B, T, d_model) — no reshape
         if self.tie_embeddings:
             logits = F.linear(x, self.tok_emb.weight)
@@ -1094,6 +1318,11 @@ def main() -> None:
         bigram_hash_size=args.bigram_hash_size, use_ortho_init=args.use_ortho_init,
         smear_enabled=args.smear_enabled, xsa_last_n=args.xsa_last_n,
         rope_dims=args.rope_dims, ln_scale_enabled=args.ln_scale_enabled,
+        depth_recurrence=args.depth_recurrence,
+        recurrence_layers=args.recurrence_layers,
+        recurrence_loops=args.recurrence_loops,
+        parallel_residuals=args.parallel_residuals,
+        parallel_res_start=args.parallel_res_start,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1114,6 +1343,9 @@ def main() -> None:
     log0(f"innovations: smear={args.smear_enabled} rope_dims={args.rope_dims} "
          f"ln_scale={args.ln_scale_enabled} xsa_last_n={args.xsa_last_n} xsa_layers={xsa_layers} "
          f"gptq_lite={args.use_gptq_lite} use_swa={args.use_swa} swa_decay={args.swa_decay}")
+    log0(f"depth_recurrence={args.depth_recurrence} recurrence_layers={args.recurrence_layers} recurrence_loops={args.recurrence_loops}")
+    log0(f"parallel_residuals={args.parallel_residuals} parallel_res_start={args.parallel_res_start}")
+    log0(f"ttt_enabled={args.ttt_enabled} ttt_rank={args.ttt_rank} ttt_lr={args.ttt_lr} ttt_steps={args.ttt_steps} ttt_entropy_weight={args.ttt_entropy_weight}")
 
     # ── optimizer split ────────────────────────────────────────
     block_named_params = list(base_model.blocks.named_parameters())
@@ -1396,6 +1628,15 @@ def main() -> None:
             val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
             stride=args.eval_stride, seq_len=args.eval_seq_len, batch_seqs=args.eval_batch_seqs,
         )
+        # TTT eval (score-first test-time training)
+        if args.ttt_enabled:
+            log0(f"final_eval_mode:sliding_window_ttt ttt_rank:{args.ttt_rank} ttt_lr:{args.ttt_lr} ttt_steps:{args.ttt_steps} ent_weight:{args.ttt_entropy_weight}")
+            ttt_val_loss, ttt_val_bpb = eval_val_sliding_ttt(
+                args, model, rank, world_size, device,
+                val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+                stride=args.eval_stride, seq_len=args.eval_seq_len, batch_seqs=args.eval_batch_seqs,
+            )
+            log0(f"final_ttt val_loss:{ttt_val_loss:.4f} val_bpb:{ttt_val_bpb:.4f}")
     else:
         log0("final_eval_mode:standard")
         q_val_loss, q_val_bpb = eval_val(
