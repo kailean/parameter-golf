@@ -1,0 +1,13 @@
+{
+  "id": "kailienhard/notebook15ae133596",
+  "title": "notebook15ae133596",
+  "code_file": "parameter_golf_smoke_test.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": "true",
+  "enable_gpu": "true",
+  "enable_internet": "true",
+  "dataset_sources": ["kailienhard/parameter-golf-data"],
+  "competition_sources": [],
+  "kernel_sources": []
+}

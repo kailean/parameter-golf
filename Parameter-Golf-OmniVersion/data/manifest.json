@@ -1,0 +1,82 @@
+{
+  "version": "10B",
+  "num_docs": 15368808,
+  "num_val_docs": 50000,
+  "shuffle_seed": null,
+  "shard_size": 100000000,
+  "append_eos": false,
+  "tokenizers": [
+    {
+      "name": "sp_bpe_4096",
+      "kind": "sentencepiece_bpe",
+      "vocab_size": 4096,
+      "bos_id": 1,
+      "eos_id": 2,
+      "model_path": "tokenizers/fineweb_4096_bpe.model",
+      "vocab_path": "tokenizers/fineweb_4096_bpe.vocab"
+    },
+    {
+      "name": "sp_bpe_8192",
+      "kind": "sentencepiece_bpe",
+      "vocab_size": 8192,
+      "bos_id": 1,
+      "eos_id": 2,
+      "model_path": "tokenizers/fineweb_8192_bpe.model",
+      "vocab_path": "tokenizers/fineweb_8192_bpe.vocab"
+    }
+  ],
+  "datasets": [
+    {
+      "name": "fineweb10B_sp4096",
+      "tokenizer_name": "sp_bpe_4096",
+      "tokenizer_kind": "sentencepiece_bpe",
+      "path": "datasets/fineweb10B_sp4096",
+      "train_glob": "datasets/fineweb10B_sp4096/fineweb_train_*.bin",
+      "val_glob": "datasets/fineweb10B_sp4096/fineweb_val_*.bin",
+      "vocab_size": 4096,
+      "bos_id": 1,
+      "eos_id": 2,
+      "stats": {
+        "docs_total": 15368808,
+        "docs_val": 50000,
+        "docs_train": 15318808,
+        "files_total": 144,
+        "files_val": 1,
+        "files_train": 143,
+        "tokens_total": 14314096356,
+        "tokens_val": 45511133,
+        "tokens_train": 14268585223
+      }
+    },
+    {
+      "name": "fineweb10B_sp8192",
+      "tokenizer_name": "sp_bpe_8192",
+      "tokenizer_kind": "sentencepiece_bpe",
+      "path": "datasets/fineweb10B_sp8192",
+      "train_glob": "datasets/fineweb10B_sp8192/fineweb_train_*.bin",
+      "val_glob": "datasets/fineweb10B_sp8192/fineweb_val_*.bin",
+      "vocab_size": 8192,
+      "bos_id": 1,
+      "eos_id": 2,
+      "stats": {
+        "docs_total": 15368808,
+        "docs_val": 50000,
+        "docs_train": 15318808,
+        "files_total": 129,
+        "files_val": 1,
+        "files_train": 128,
+        "tokens_total": 12748339616,
+        "tokens_val": 40541315,
+        "tokens_train": 12707798301
+      }
+    }
+  ],
+  "tokenizer_specs": [
+    {
+      "name": "sp_bpe_8192",
+      "kind": "sentencepiece_bpe",
+      "vocab_size": 8192,
+      "tokenizer_train_docs": 5000000
+    }
+  ]
+}
