@@ -174,11 +174,13 @@ def train():
     script = f"{repo_dir}/train_gpt_kl.py"
     start = time.time()
 
-    # Use torchrun for 8×H100 DDP
+    # Auto-detect GPU count for torchrun
+    nproc = max(1, gpu_count)
+    print(f"🐉 Launching torchrun with {nproc} GPU(s)...", flush=True)
     process = subprocess.Popen(
         [
             sys.executable, "-m", "torch.distributed.run",
-            "--nproc_per_node=8",
+            f"--nproc_per_node={nproc}",
             script,
         ],
         env=env,
