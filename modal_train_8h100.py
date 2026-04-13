@@ -141,7 +141,8 @@ def train():
         "EMA_DECAY": "0.9965",
         "EMA_START_FRAC": "0.5",
         # QAT — START AT STEP 0 to avoid 350s recompile mid-run!
-        "QAT_START_FRAC": "1.0",  # QAT off — rely on GPTQ-lite post-hoc quant
+        "QAT_START_FRAC": "1.0",  # UNUSED — late_qat_threshold controls QAT
+        "LATE_QAT_THRESHOLD": "0.0",  # Disable QAT entirely — rely on GPTQ-lite post-hoc
         "USE_ORTHO_INIT": "1",
         # SOTA architecture
         "SMEAR_ENABLED": "1",
