@@ -40,7 +40,7 @@ HOURLY_RATE_8XH100 = 4.89 * 8  # ~$39.12/hr
 
 @app.function(
     image=image,
-    gpu="H100:8",
+    gpu="H100",
     volumes={"/data": vol, "/models": MODEL_VOL},
     timeout=7200,   # 2hr hard cap
     memory=32768,
@@ -141,7 +141,7 @@ def train():
         "EMA_DECAY": "0.9965",
         "EMA_START_FRAC": "0.5",
         # QAT — START AT STEP 0 to avoid 350s recompile mid-run!
-        "QAT_START_FRAC": "0",
+        "QAT_START_FRAC": "1.0",  # QAT off — rely on GPTQ-lite post-hoc quant
         "USE_ORTHO_INIT": "1",
         # SOTA architecture
         "SMEAR_ENABLED": "1",
@@ -156,12 +156,9 @@ def train():
         # Parallel residuals (GPT-J style, L7+)
         "PARALLEL_RESIDUALS": "1",
         "PARALLEL_RES_START": "7",
-        # TTT with score-first (rollback if worse) — legal per Issue #1017
-        "TTT_ENABLED": "1",
-        "TTT_DOC_INDEPENDENT": "1",
-        "TTT_RANK": "4",
-        "TTT_LR": "0.0005",                   # Lower LR to avoid overshooting
-        "TTT_STEPS": "3",
+        # TTT disabled — one variable at a time, test bigger model first
+        "TTT_ENABLED": "0",
+        "EMBED_BITS": "8",                     # int8 for embeddings, int6 for weights (SOTA approach)
         # CRITICAL: BigramHash OFF for SP8192
         "BIGRAM_HASH_SIZE": "0",
         # Eval — only at the very end (save 30s per eval)

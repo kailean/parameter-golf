@@ -810,7 +810,13 @@ def quantize_float_tensor_gptq_lite(t: Tensor):
     return packed, torch.tensor(float(scale), dtype=torch.float32), orig_shape, orig_len
 
 
-def quantize_state_dict_int6(state_dict: dict[str, Tensor], use_gptq_lite: bool = False):
+def quantize_state_dict_int6(state_dict: dict[str, Tensor], use_gptq_lite: bool = False, embed_bits: int = 6):
+    """Quantize state dict to int6 (or mixed int8/int6 for embeddings).
+    
+    embed_bits=6: all weights int6 (default, competition standard)
+    embed_bits=8: embedding matrices (tok_emb, lm_head) use int8, rest int6 (SOTA approach)
+    """
+    _EMBED_PATTERNS = ("tok_emb.weight", "lm_head.weight")
     quantized: dict[str, np.ndarray]    = {}
     scales:    dict[str, Tensor]        = {}
     shapes:    dict[str, tuple]         = {}
@@ -838,17 +844,32 @@ def quantize_state_dict_int6(state_dict: dict[str, Tensor], use_gptq_lite: bool 
             stats["int6_payload_bytes"] += tensor_nbytes(kept)
             continue
         stats["num_float_tensors"] += 1
-        _quant_fn = quantize_float_tensor_gptq_lite if use_gptq_lite else quantize_float_tensor
-        packed, s, orig_shape, orig_len = _quant_fn(t)
-        if s.ndim > 0:
-            qmeta[name] = {"scheme": "per_row", "axis": 0}
-        quantized[name] = packed
-        scales[name]    = s
-        shapes[name]    = orig_shape
-        dtypes[name]    = str(t.dtype).removeprefix("torch.")
-        stats["int6_payload_bytes"] += tensor_nbytes(packed) + tensor_nbytes(s)
+        
+        # Mixed quantization: int8 for embeddings, int6 for weights
+        use_int8 = (embed_bits == 8 and any(p in name for p in _EMBED_PATTERNS))
+        if use_int8:
+            q_int8, s_int8 = quantize_float_tensor_int8(t)
+            # Store int8 quantized data in the same format as int6 but mark it
+            packed_raw = q_int8.cpu().numpy().tobytes()
+            packed_np = np.frombuffer(packed_raw, dtype=np.uint8).copy()
+            quantized[name] = packed_np
+            scales[name]    = s_int8
+            shapes[name]    = t.shape
+            dtypes[name]    = str(t.dtype).removeprefix("torch.")
+            qmeta[name] = {"scheme": "per_row_int8", "axis": 0}
+            stats["int6_payload_bytes"] += len(packed_raw) + tensor_nbytes(s_int8)
+        else:
+            _quant_fn = quantize_float_tensor_gptq_lite if use_gptq_lite else quantize_float_tensor
+            packed, s, orig_shape, orig_len = _quant_fn(t)
+            if s.ndim > 0:
+                qmeta[name] = {"scheme": "per_row", "axis": 0}
+            quantized[name] = packed
+            scales[name]    = s
+            shapes[name]    = orig_shape
+            dtypes[name]    = str(t.dtype).removeprefix("torch.")
+            stats["int6_payload_bytes"] += tensor_nbytes(packed) + tensor_nbytes(s)
     obj: dict[str, object] = {
-        "__quant_format__": "int6_packed_per_row_v1",
+        "__quant_format__": "int6_packed_per_row_v1" if embed_bits == 6 else "mixed_int8_int6_packed_v1",
         "quantized": quantized, "scales": scales, "shapes": shapes,
         "dtypes": dtypes, "passthrough": passthrough,
     }
@@ -957,18 +978,29 @@ def dequantize_state_dict_int6(obj: dict[str, object]) -> dict[str, Tensor]:
     qmeta  = obj.get("qmeta", {})
     pt_dtypes = obj.get("passthrough_orig_dtypes", {})
     shapes = obj.get("shapes", {})
+    quant_format = obj.get("__quant_format__", "int6_packed_per_row_v1")
     for name, packed in obj["quantized"].items():
         orig_shape = shapes[name]
         orig_len   = int(np.prod(orig_shape))
-        q_np = unpack_int6_np(np.asarray(packed, dtype=np.uint8), orig_len).reshape(orig_shape)
-        dtype = getattr(torch, obj["dtypes"][name])
-        s = obj["scales"][name]
-        if qmeta.get(name, {}).get("scheme") == "per_row" or s.ndim > 0:
+        meta = qmeta.get(name, {})
+        # Handle int8 quantized tensors (mixed int8/int6 format)
+        if meta.get("scheme") == "per_row_int8":
+            q_int8 = np.frombuffer(packed.tobytes() if isinstance(packed, np.ndarray) else packed, dtype=np.int8).copy().reshape(orig_shape)
+            dtype = getattr(torch, obj["dtypes"][name])
+            s = obj["scales"][name]
             s32 = s.to(dtype=torch.float32)
-            q_t = torch.from_numpy(q_np.astype(np.float32))
+            q_t = torch.from_numpy(q_int8.astype(np.float32))
             out[name] = (q_t * s32.view(q_t.shape[0], *([1] * (q_t.ndim - 1)))).to(dtype=dtype).contiguous()
         else:
-            out[name] = (torch.from_numpy(q_np.astype(np.float32)) * float(s.item())).to(dtype=dtype).contiguous()
+            q_np = unpack_int6_np(np.asarray(packed, dtype=np.uint8), orig_len).reshape(orig_shape)
+            dtype = getattr(torch, obj["dtypes"][name])
+            s = obj["scales"][name]
+            if meta.get("scheme") == "per_row" or s.ndim > 0:
+                s32 = s.to(dtype=torch.float32)
+                q_t = torch.from_numpy(q_np.astype(np.float32))
+                out[name] = (q_t * s32.view(q_t.shape[0], *([1] * (q_t.ndim - 1)))).to(dtype=dtype).contiguous()
+            else:
+                out[name] = (torch.from_numpy(q_np.astype(np.float32)) * float(s.item())).to(dtype=dtype).contiguous()
     for name, t in obj["passthrough"].items():
         out_t = t.detach().to("cpu").contiguous() if isinstance(t, Tensor) else torch.from_numpy(np.array(t))
         orig  = pt_dtypes.get(name)
