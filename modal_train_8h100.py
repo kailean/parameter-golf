@@ -40,8 +40,7 @@ HOURLY_RATE_8XH100 = 4.89 * 8  # ~$39.12/hr
 
 @app.function(
     image=image,
-    gpu="H100",
-    count=8,
+    gpu="H100:8",
     volumes={"/data": vol, "/models": MODEL_VOL},
     timeout=7200,   # 2hr hard cap
     memory=32768,
@@ -141,8 +140,8 @@ def train():
         "MUON_MOMENTUM": "0.99",
         "EMA_DECAY": "0.9965",
         "EMA_START_FRAC": "0.5",
-        # QAT
-        "QAT_START_FRAC": "0.15",
+        # QAT — START AT STEP 0 to avoid 350s recompile mid-run!
+        "QAT_START_FRAC": "0",
         "USE_ORTHO_INIT": "1",
         # SOTA architecture
         "SMEAR_ENABLED": "1",
@@ -161,8 +160,8 @@ def train():
         "TTT_ENABLED": "0",
         # CRITICAL: BigramHash OFF for SP8192
         "BIGRAM_HASH_SIZE": "0",
-        # Eval settings
-        "VAL_LOSS_EVERY": "500",
+        # Eval — only at the very end (save 30s per eval)
+        "VAL_LOSS_EVERY": "99999",
         "VAL_BATCH_SIZE": "524288",
         "TRAIN_LOG_EVERY": "50",
         "EVAL_SEQ_LEN": "2048",
