@@ -118,10 +118,10 @@ def train():
         "TOKENIZER_PATH": tokenizer_path,
         "VOCAB_SIZE": "8192",
         "NUM_LAYERS": "11",
-        "MODEL_DIM": "512",
-        "NUM_HEADS": "8",
-        "NUM_KV_HEADS": "4",
-        "MLP_MULT": "3",                    # ~27M params → ~6-7MB int6+brotli
+        "MODEL_DIM": "640",
+        "NUM_HEADS": "10",
+        "NUM_KV_HEADS": "5",
+        "MLP_MULT": "4",                    # ~52M params → ~14.8MB mixed int8/int6+brotli
         "TIE_EMBEDDINGS": "1",
         "TIED_EMBED_INIT_STD": "0.005",
         "QK_GAIN_INIT": "5.25",
@@ -156,8 +156,12 @@ def train():
         # Parallel residuals (GPT-J style, L7+)
         "PARALLEL_RESIDUALS": "1",
         "PARALLEL_RES_START": "7",
-        # TTT DISABLED — was hurting (1.73 vs 1.18 without)
-        "TTT_ENABLED": "0",
+        # TTT with score-first (rollback if worse) — legal per Issue #1017
+        "TTT_ENABLED": "1",
+        "TTT_DOC_INDEPENDENT": "1",
+        "TTT_RANK": "4",
+        "TTT_LR": "0.0005",                   # Lower LR to avoid overshooting
+        "TTT_STEPS": "3",
         # CRITICAL: BigramHash OFF for SP8192
         "BIGRAM_HASH_SIZE": "0",
         # Eval — only at the very end (save 30s per eval)

@@ -636,26 +636,56 @@ def eval_val_sliding_ttt(
             # Apply LoRA
             originals = apply_lora(adapters)
 
-            # TTT: gradient steps on prefix tokens
+            # TTT: gradient steps on prefix tokens (score-first)
+            # Score-first: compute baseline loss, then adapt, then only keep if improved
             prefix_len = max(seq_len // 4, 1)  # Use first 25% as TTT prefix
+            
+            # Save original LoRA state for score-first rollback
+            orig_lora_data = [(a_q.data.clone(), b_q.data.clone(), a_v.data.clone(), b_v.data.clone()) for a_q, b_q, a_v, b_v in adapters]
+            
+            # Compute baseline loss on prefix before TTT
+            with torch.no_grad():
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    bl_logits = base_model.forward_logits(x_batch[:, :prefix_len])
+                baseline_loss = F.cross_entropy(
+                    bl_logits.reshape(-1, bl_logits.size(-1)).float(),
+                    y_batch[:, :prefix_len].reshape(-1),
+                    reduction="mean",
+                ).item()
+            
             for ttt_step in range(ttt_steps):
                 with torch.enable_grad():
                     with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                         logits = base_model.forward_logits(x_batch[:, :prefix_len])
-                    log_probs = F.log_softmax(logits.float(), dim=-1)
-                    # Gather log probs for target tokens
-                    tgt = y_batch[:, :prefix_len]
-                    log_prob = log_probs.gather(-1, tgt.unsqueeze(-1)).squeeze(-1)  # (B, T_prefix)
-                    # Compute entropy of prediction distribution
-                    probs = torch.exp(log_probs)
-                    entropy = -(probs * log_probs).sum(dim=-1)  # (B, T_prefix)
-                    entropy_normalized = entropy / max_ent  # [0, 1]
-                    # Entropy-weighted loss: uncertain positions get larger gradients
-                    loss = (-log_prob * (1.0 + ent_weight * entropy_normalized)).mean()
+                    # Standard NLL loss (no entropy weighting — that was hurting)
+                    loss = F.cross_entropy(
+                        logits.reshape(-1, logits.size(-1)).float(),
+                        y_batch[:, :prefix_len].reshape(-1),
+                        reduction="mean",
+                    )
                 # Gradient step
                 grads = torch.autograd.grad(loss, lora_params)
                 for p, g in zip(lora_params, grads):
                     p.data -= ttt_lr * g
+
+            # Score-first check: compute loss after TTT, rollback if worse
+            with torch.no_grad():
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    ad_logits = base_model.forward_logits(x_batch[:, :prefix_len])
+                adapted_loss = F.cross_entropy(
+                    ad_logits.reshape(-1, ad_logits.size(-1)).float(),
+                    y_batch[:, :prefix_len].reshape(-1),
+                    reduction="mean",
+                ).item()
+            
+            # Rollback if TTT made things worse
+            if adapted_loss > baseline_loss:
+                for (a_q, b_q, a_v, b_v), (oa_q, ob_q, oa_v, ob_v) in zip(adapters, orig_lora_data):
+                    a_q.data.copy_(oa_q); b_q.data.copy_(ob_q)
+                    a_v.data.copy_(oa_v); b_v.data.copy_(ob_v)
+                # Re-apply the original (rolled-back) LoRA
+                restore_lora(originals)
+                originals = apply_lora(adapters)
 
             # Score full window with adapted model
             with torch.no_grad():
