@@ -118,6 +118,9 @@ class Hyperparameters:
     ttt_entropy_weight = float(os.environ.get("TTT_ENTROPY_WEIGHT", "1.0"))
     ttt_doc_independent = bool(int(os.environ.get("TTT_DOC_INDEPENDENT", "1")))
 
+    # LeakyReLU² — 0.0 = standard ReLU², >0 = LeakyReLU²(slope)
+    leaky_relu_slope = float(os.environ.get("LEAKY_RELU_SLOPE", "0.0"))
+
     # Optimizer
     embed_lr        = float(os.environ.get("EMBED_LR", 0.6))
     head_lr         = float(os.environ.get("HEAD_LR", 0.008))
@@ -156,6 +159,39 @@ INT6_KEEP_FLOAT_FP32_NAME_PATTERNS = tuple(
 INT6_KEEP_FLOAT_MAX_NUMEL   = 65_536
 INT6_KEEP_FLOAT_STORE_DTYPE = torch.float16
 INT6_PER_ROW_SCALE_DTYPE    = torch.float16
+
+# Byte shuffle for improved brotli compression (SOTA trick)
+# Interleaves bytes so similar-value bytes are grouped → 3-5x better brotli ratio
+_BSHF_MAGIC = b"BSHF"
+
+def _byte_shuffle(data: bytes, stride: int = 2) -> bytes:
+    if stride <= 1 or len(data) < stride:
+        return data
+    src = np.frombuffer(data, dtype=np.uint8)
+    n = len(src)
+    out = np.empty(n, dtype=np.uint8)
+    dest_off = 0
+    for pos in range(stride):
+        chunk = src[pos::stride]
+        out[dest_off:dest_off + len(chunk)] = chunk
+        dest_off += len(chunk)
+    return _BSHF_MAGIC + bytes([stride]) + out.tobytes()
+
+def _byte_unshuffle(data: bytes) -> bytes:
+    if len(data) < 5 or data[:4] != _BSHF_MAGIC:
+        return data
+    stride = data[4]
+    if stride < 2:
+        return data[5:]
+    src = np.frombuffer(data[5:], dtype=np.uint8)
+    n = len(src)
+    out = np.empty(n, dtype=np.uint8)
+    src_off = 0
+    for pos in range(stride):
+        chunk_len = (n - pos + stride - 1) // stride
+        out[pos:n:stride] = src[src_off:src_off + chunk_len]
+        src_off += chunk_len
+    return out.tobytes()
 INT6_CLIP_Q                 = 99.99984 / 100.0
 # GPTQ-lite: 5 percentile candidates to search per row
 _GPTQ_PERCENTILES = [99.90, 99.95, 99.99, 99.999, 100.0]
@@ -1212,27 +1248,32 @@ class CausalSelfAttention(nn.Module):
 
 
 class MLP(nn.Module):
-    def __init__(self, dim: int, mlp_mult: int):
+    def __init__(self, dim: int, mlp_mult: int, leaky_slope: float = 0.0):
         super().__init__()
         hidden    = mlp_mult * dim
         self.fc   = CastedLinear(dim, hidden, bias=False)
         self.proj = CastedLinear(hidden, dim, bias=False)
         self.proj._zero_init = True
+        self.leaky_slope = leaky_slope  # 0 = standard ReLU², >0 = LeakyReLU²(slope)
 
     def forward(self, x: Tensor) -> Tensor:
-        x = torch.relu(self.fc(x))
+        if self.leaky_slope > 0:
+            x = torch.nn.functional.leaky_relu(self.fc(x), self.leaky_slope)
+        else:
+            x = torch.relu(self.fc(x))
         return self.proj(x.square())
 
 
 class Block(nn.Module):
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int, rope_base: float, qk_gain_init: float,
-                 use_xsa: bool = False, rope_dims: int = 0, layer_idx: int = 0, use_ln_scale: bool = True):
+                 use_xsa: bool = False, rope_dims: int = 0, layer_idx: int = 0, use_ln_scale: bool = True,
+                 leaky_slope: float = 0.0):
         super().__init__()
         self.attn_norm  = RMSNorm()
         self.mlp_norm   = RMSNorm()
         self.attn       = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init,
                                               use_xsa=use_xsa, rope_dims=rope_dims)
-        self.mlp        = MLP(dim, mlp_mult)
+        self.mlp        = MLP(dim, mlp_mult, leaky_slope=leaky_slope)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale  = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix  = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
@@ -1279,6 +1320,7 @@ class GPT(nn.Module):
         recurrence_loops: int = 2,
         parallel_residuals: bool = False,
         parallel_res_start: int = 7,
+        leaky_slope: float = 0.0,
     ):
         super().__init__()
         self.tie_embeddings     = tie_embeddings
@@ -1304,7 +1346,8 @@ class GPT(nn.Module):
         self.blocks             = nn.ModuleList([
             Block(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init,
                   use_xsa=(i >= self.num_encoder_layers + xsa_decoder_start),
-                  rope_dims=rope_dims, layer_idx=i, use_ln_scale=ln_scale_enabled)
+                  rope_dims=rope_dims, layer_idx=i, use_ln_scale=ln_scale_enabled,
+                  leaky_slope=leaky_slope)
             for i in range(num_layers)
         ])
         self.final_norm = RMSNorm()
@@ -1483,6 +1526,7 @@ def main() -> None:
         recurrence_loops=args.recurrence_loops,
         parallel_residuals=args.parallel_residuals,
         parallel_res_start=args.parallel_res_start,
+        leaky_slope=args.leaky_relu_slope,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1505,6 +1549,8 @@ def main() -> None:
          f"gptq_lite={args.use_gptq_lite} use_swa={args.use_swa} swa_decay={args.swa_decay}")
     log0(f"depth_recurrence={args.depth_recurrence} recurrence_layers={args.recurrence_layers} recurrence_loops={args.recurrence_loops}")
     log0(f"parallel_residuals={args.parallel_residuals} parallel_res_start={args.parallel_res_start}")
+    if args.leaky_relu_slope > 0:
+        log0(f"leaky_relu_slope={args.leaky_relu_slope} (LeakyReLU²)")
     log0(f"ttt_enabled={args.ttt_enabled} ttt_rank={args.ttt_rank} ttt_lr={args.ttt_lr} ttt_steps={args.ttt_steps} ttt_entropy_weight={args.ttt_entropy_weight}")
 
     # ── optimizer split ────────────────────────────────────────
@@ -1775,11 +1821,22 @@ def main() -> None:
         )
         log0(f"Total submission size int8+zlib: {quant_file_bytes + code_bytes} bytes")
 
-    # Also produce int6+zstd for comparison (our internal format)
+    # int6+brotli — use custom flat binary serializer (no pickle overhead, no byte shuffle)
     quant_obj_int6, quant_stats_int6 = quantize_state_dict_int6(base_model.state_dict(), use_gptq_lite=args.use_gptq_lite, embed_bits=args.embed_bits)
-    quant_buf_int6 = io.BytesIO()
-    torch.save(quant_obj_int6, quant_buf_int6)
-    quant_raw_int6 = quant_buf_int6.getvalue()
+    # Custom serializer: eliminates ~14MB pickle overhead from torch.save
+    # Byte shuffle removed — it HURTS compression on well-structured int6 data
+    # (verified: plain brotli 5.26MB vs stride=2 shuffle 7.00MB for 640d model)
+    try:
+        from custom_serializer import serialize_quantized, deserialize_quantized
+        quant_raw_int6 = serialize_quantized(quant_obj_int6)
+        log0(f"custom_serializer: {len(quant_raw_int6):,} bytes (vs torch.save ~57MB)")
+        _use_custom_serializer = True
+    except ImportError:
+        quant_buf_int6 = io.BytesIO()
+        torch.save(quant_obj_int6, quant_buf_int6)
+        quant_raw_int6 = quant_buf_int6.getvalue()
+        log0(f"torch.save fallback: {len(quant_raw_int6):,} bytes")
+        _use_custom_serializer = False
 
     # ── int6+brotli (competition-winning format, smallest) ──
     quant_blob_int6_brotli = brotli.compress(quant_raw_int6, quality=11)
@@ -1809,7 +1866,11 @@ def main() -> None:
     # Load and roundtrip the int6+brotli model (competition format)
     with open("final_model.int6.brotli.ptz", "rb") as f:
         quant_blob_disk = f.read()
-    quant_state = torch.load(io.BytesIO(brotli.decompress(quant_blob_disk)), map_location="cpu", weights_only=False)
+    decompressed_raw = brotli.decompress(quant_blob_disk)
+    if _use_custom_serializer:
+        quant_state = deserialize_quantized(decompressed_raw)
+    else:
+        quant_state = torch.load(io.BytesIO(decompressed_raw), map_location="cpu", weights_only=False)
     base_model.load_state_dict(dequantize_state_dict_int6(quant_state), strict=True)
 
     torch.cuda.synchronize()
