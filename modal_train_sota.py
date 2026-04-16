@@ -174,17 +174,20 @@ class Trainer:
         print(f"   Key params: 13L × 512d × MLP4, TTT LoRA96, GPTQ cal, delta_rows, stride=3", flush=True)
         start = time.time()
 
+        # Use unbuffered python (-u) and pipe both stdout+stderr
         proc = subprocess.Popen(
-            ["python3", os.path.join(work_dir, "train_gpt_kl.py")],
+            ["python3", "-u", os.path.join(work_dir, "train_gpt_kl.py")],
             env=env,
             cwd=work_dir,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
+            bufsize=0,
         )
-        for line in proc.stdout:
-            print(line, end="", flush=True)
+        while True:
+            chunk = proc.stdout.read(256)
+            if not chunk:
+                break
+            print(chunk.decode("utf-8", errors="replace"), end="", flush=True)
         proc.wait()
 
         elapsed = time.time() - start
