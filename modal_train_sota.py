@@ -135,8 +135,8 @@ class Trainer:
             "GPTQ_CALIBRATION_BATCHES": "64",
             "MATRIX_CLIP_SIGMAS": "12.85", # SOTA
             "EMBED_CLIP_SIGMAS": "20.0",   # SOTA
-            "DELTA_ENCODE_ROWS": "1",      # SOTA: row-delta encoding
-            "BYTE_SHUFFLE_STRIDE": "3",     # SOTA: was 2
+            "DELTA_ENCODE_ROWS": "0",      # Row-delta HURTS compression on trained data
+            "BYTE_SHUFFLE_STRIDE": "2",     # stride=2 is our proven setting
             "BROTLI_QUALITY": "11",
             # Optimizer
             "MUON_WEIGHT_DECAY": "0.095",  # SOTA: was 0.04
@@ -149,7 +149,7 @@ class Trainer:
             "WARMDOWN_FRAC": "0.72",       # SOTA: 72% warmdown
             "VAL_LOSS_EVERY": "500",
             "TRAIN_LOG_EVERY": "50",
-            "MAX_WALLCLOCK_SECONDS": "3600",  # 1hr for single A100
+            "MAX_WALLCLOCK_SECONDS": "7200",  # 2hr for single A100
             # TTT — SOTA LoRA rank 96
             "TTT_ENABLED": "1",
             "TTT_RANK": "96",              # SOTA: was 4
