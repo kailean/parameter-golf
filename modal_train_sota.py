@@ -32,7 +32,7 @@ MODEL_VOL = modal.Volume.from_name("parameter-golf-models", create_if_missing=Tr
 
 @app.cls(
     image=image,
-    gpu="A100-80GB",
+    gpu="H100",
     volumes={"/data": vol, "/models": MODEL_VOL},
     timeout=7200,
     memory=32768,
@@ -149,7 +149,7 @@ class Trainer:
             "WARMDOWN_FRAC": "0.72",       # SOTA: 72% warmdown
             "VAL_LOSS_EVERY": "500",
             "TRAIN_LOG_EVERY": "50",
-            "MAX_WALLCLOCK_SECONDS": "7200",  # 2hr for single A100
+            "MAX_WALLCLOCK_SECONDS": "0",  # No wallclock cap — run to completion
             # TTT — SOTA LoRA rank 96
             "TTT_ENABLED": "1",
             "TTT_RANK": "96",              # SOTA: was 4
