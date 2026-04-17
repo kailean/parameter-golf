@@ -1,0 +1,13 @@
+{
+  "id": "kailienhard/phase1-512d-mlp3-gpu",
+  "title": "Phase1 512d MLP3 GPU v4",
+  "code_file": "kaggle_phase1.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "competition_sources": [],
+  "dataset_sources": [],
+  "kernel_sources": [],
+  "enable_gpu": true,
+  "enable_internet": true
+}

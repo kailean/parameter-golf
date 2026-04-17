@@ -1,83 +1,73 @@
 #!/usr/bin/env python3
 """
-OmniClaw Parameter Golf — Phase 1 Experiment
-512d MLP×3 + WD warmdown schedule
-Kaggle T4/P100 (FREE)
+Minimal Kaggle Phase 1 runner.
+This is the NOTEBOOK code — it uses Kaggle's built-in git clone.
 """
 import subprocess
 import os
 import sys
 import time
 
-def run(cmd, **kwargs):
-    """Run command with error handling"""
-    result = subprocess.run(cmd, capture_output=True, text=True, **kwargs)
-    if result.returncode != 0:
-        print(f"ERROR running: {' '.join(cmd)}", flush=True)
-        print(f"  stdout: {result.stdout[:500]}", flush=True)
-        print(f"  stderr: {result.stderr[:500]}", flush=True)
-        return False
-    return True
+# Step 1: Check environment
+print("="*60, flush=True)
+print("PHASE 1: 512d MLP×3 + WD Warmdown", flush=True)
+print("="*60, flush=True)
 
 # Check GPU
-print("🔍 Checking GPU...", flush=True)
 try:
-    r = subprocess.run(["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader"], capture_output=True, text=True, timeout=10)
-    if r.returncode == 0:
-        print(f"  GPU: {r.stdout.strip()}", flush=True)
+    import torch
+    print(f"PyTorch: {torch.__version__}", flush=True)
+    print(f"CUDA available: {torch.cuda.is_available()}", flush=True)
+    if torch.cuda.is_available():
+        print(f"GPU: {torch.cuda.get_device_name(0)}", flush=True)
+        print(f"VRAM: {torch.cuda.get_device_properties(0).total_mem / 1e9:.1f} GB", flush=True)
     else:
-        print("  ⚠️ nvidia-smi failed, checking torch...", flush=True)
-except Exception:
-    print("  ⚠️ nvidia-smi not found, checking torch...", flush=True)
+        print("⚠️ No GPU! Running on CPU (will be very slow)", flush=True)
+except ImportError:
+    print("ERROR: PyTorch not installed", flush=True)
+    sys.exit(1)
 
-# Install dependencies one at a time with error handling
-for pkg in ["brotli", "zstandard", "sentencepiece"]:
-    print(f"📦 Installing {pkg}...", flush=True)
-    if not run(["pip", "install", "-q", pkg]):
-        print(f"  ⚠️ Failed to install {pkg}, continuing...", flush=True)
-
-# Check torch
-import torch
-print(f"  PyTorch: {torch.__version__}, CUDA: {torch.cuda.is_available()}", flush=True)
-
-# Clone repo
-print("📥 Cloning repo...", flush=True)
+# Step 2: Clone repo
 work_dir = "/kaggle/working/parameter-golf"
 if os.path.exists(work_dir):
-    subprocess.run(["rm", "-rf", work_dir], check=True)
+    import shutil
+    shutil.rmtree(work_dir)
 
+print("\n📥 Cloning repo...", flush=True)
 r = subprocess.run(
     ["git", "clone", "-b", "kailean/submission-v3", "--depth", "1",
      "https://github.com/kailean/parameter-golf.git", work_dir],
     capture_output=True, text=True, timeout=120
 )
 if r.returncode != 0:
-    print(f"  Git clone FAILED: {r.stderr[:500]}", flush=True)
-    print("  Trying pip install instead...", flush=True)
-    # Fallback: upload train_gpt_kl.py directly
+    print(f"Git clone FAILED: {r.stderr[:500]}", flush=True)
     sys.exit(1)
+print("✅ Cloned", flush=True)
 
-print(f"  ✅ Cloned to {work_dir}", flush=True)
+# Step 3: Install deps
+print("\n📦 Installing dependencies...", flush=True)
+for pkg in ["brotli", "zstandard", "sentencepiece"]:
+    subprocess.run(["pip", "install", "-q", pkg], capture_output=True, timeout=60)
+print("✅ Dependencies installed", flush=True)
 
-# Download data
+# Step 4: Download data
 data_dir = os.path.join(work_dir, "data", "datasets", "fineweb10B_sp8192")
 if not os.path.exists(data_dir):
-    print("📥 Downloading SP8192 data...", flush=True)
+    print("\n📥 Downloading SP8192 data...", flush=True)
     r = subprocess.run(
         ["python3", os.path.join(work_dir, "data", "cached_challenge_fineweb.py"),
          "--variant", "sp8192", "--skip-manifest"],
         cwd=work_dir, capture_output=True, text=True, timeout=600
     )
     if r.returncode != 0:
-        print(f"  Data download FAILED: {r.stderr[:500]}", flush=True)
+        print(f"Data download FAILED: {r.stderr[:500]}", flush=True)
         sys.exit(1)
-    print("  ✅ Data downloaded", flush=True)
+    print("✅ Data downloaded", flush=True)
 
-# Verify data
 shards = [f for f in os.listdir(data_dir) if f.endswith(".bin") and "train" in f]
 print(f"  Train shards: {len(shards)}", flush=True)
 
-# Phase 1: 512d MLP×3 + WD warmdown
+# Step 5: Train!
 env = {
     **os.environ,
     "DATA_PATH": data_dir,
@@ -121,7 +111,7 @@ env = {
     "WARMDOWN_WD_FRAC": "0.37",
     "LATE_QAT_THRESHOLD": "0.0",
     "ITERATIONS": "2000",
-    "TRAIN_BATCH_TOKENS": "393216",  # Reduced for T4 (16GB VRAM)
+    "TRAIN_BATCH_TOKENS": "393216",
     "WARMUP_STEPS": "20",
     "WARMDOWN_FRAC": "0.50",
     "VAL_LOSS_EVERY": "500",
@@ -135,7 +125,7 @@ env = {
     "DDP_BUCKET_CAP_MB": "64",
 }
 
-print("🚀 Starting Phase 1: 512d MLP×3 + WD warmdown on Kaggle!", flush=True)
+print("\n🚀 Starting training...", flush=True)
 start = time.time()
 
 proc = subprocess.Popen(
@@ -153,15 +143,17 @@ proc.wait()
 elapsed = time.time() - start
 print(f"\n⏱ Took {elapsed:.0f}s ({elapsed/60:.1f}min)", flush=True)
 
-# Report the TWO numbers that matter
+# Step 6: Report results
 print("\n" + "="*60, flush=True)
-print("PHASE 1 RESULTS", flush=True)
+print("PHASE 1 RESULTS — THE ONLY NUMBERS THAT MATTER", flush=True)
 print("="*60, flush=True)
 
 model_path = os.path.join(work_dir, "final_model.int6.brotli.ptz")
 if os.path.exists(model_path):
     size_bytes = os.path.getsize(model_path)
-    code_bytes = len(open(os.path.join(work_dir, "train_gpt_kl.py")).read().encode()) + len(open(os.path.join(work_dir, "custom_serializer.py")).read().encode())
+    code_path = os.path.join(work_dir, "train_gpt_kl.py")
+    cs_path = os.path.join(work_dir, "custom_serializer.py")
+    code_bytes = len(open(code_path).read().encode()) + len(open(cs_path).read().encode())
     total = size_bytes + code_bytes
     fits = total < 16_000_000
     print(f"  Compressed size: {total:,} bytes ({total/1e6:.2f}MB)", flush=True)
@@ -176,7 +168,10 @@ for lf in sorted(glob.glob(os.path.join(work_dir, "logs", "*.txt")), key=os.path
         for line in f:
             if "best_val_bpb:" in line:
                 parts = line.split("best_val_bpb:")[1].strip().split()
-                best_bpb = float(parts[0])
+                try:
+                    best_bpb = float(parts[0])
+                except:
+                    pass
                 break
     if best_bpb:
         break
