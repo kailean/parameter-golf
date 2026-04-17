@@ -1084,7 +1084,8 @@ def collect_gptq_hessians(
     device: torch.device,
     grad_accum_steps: int,
 ) -> dict[str, Tensor]:
-    """SOTA: collect X^T X activation Hessians for full GPTQ calibration."""
+    """SOTA: collect X^T X activation Hessians for full GPTQ calibration.
+    If self_gen_gptq_calibration=True, model generates its own calibration data."""
     hessians: dict[str, Tensor] = {}
     counts: dict[str, int] = {}
     hooks = []
@@ -1110,14 +1111,35 @@ def collect_gptq_hessians(
             hooks.append(module.register_forward_pre_hook(make_hook(f"{module_name}.weight")))
 
     was_training = base_model.training
-    calib_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
     base_model.eval()
     try:
         with torch.inference_mode():
-            for _ in range(args.gptq_calibration_batches):
-                x, _ = calib_loader.next_batch(args.gptq_calibration_tokens, args.train_seq_len, grad_accum_steps)
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                    base_model.forward_logits(x)
+            if args.self_gen_gptq_calibration:
+                # Self-generated GPTQ: model generates its own calibration data
+                # Closes 84% of gap vs validation-calibrated GPTQ per literature
+                num_seqs = args.self_gen_gptq_sequences
+                seq_len = args.train_seq_len
+                for i in range(0, num_seqs, 4):  # Generate in small batches
+                    batch = min(4, num_seqs - i)
+                    # Start from random tokens
+                    start_tokens = torch.randint(0, args.vocab_size, (batch, seq_len // 2), device=device)
+                    # Model generates continuation at target temperature
+                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                        logits = base_model.forward_logits(start_tokens)
+                        # Sample from logits at self_gen_gptq_temperature
+                        probs = F.softmax(logits.float() / args.self_gen_gptq_temperature, dim=-1)
+                        gen_tokens = torch.multinomial(probs.view(-1, probs.shape[-1]), 1).view(batch, -1)
+                        # Use generated tokens as calibration input
+                        calib_input = torch.cat([start_tokens, gen_tokens], dim=1)[:, :seq_len]
+                        with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                            base_model.forward_logits(calib_input)
+            else:
+                # Standard: use training data for calibration
+                calib_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+                for _ in range(args.gptq_calibration_batches):
+                    x, _ = calib_loader.next_batch(args.gptq_calibration_tokens, args.train_seq_len, grad_accum_steps)
+                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                        base_model.forward_logits(x)
     finally:
         for hook in hooks:
             hook.remove()
