@@ -21,8 +21,14 @@ def run(cmd, **kwargs):
 
 # Check GPU
 print("🔍 Checking GPU...", flush=True)
-r = subprocess.run(["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader"], capture_output=True, text=True)
-print(f"  GPU: {r.stdout.strip()}", flush=True)
+try:
+    r = subprocess.run(["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader"], capture_output=True, text=True, timeout=10)
+    if r.returncode == 0:
+        print(f"  GPU: {r.stdout.strip()}", flush=True)
+    else:
+        print("  ⚠️ nvidia-smi failed, checking torch...", flush=True)
+except Exception:
+    print("  ⚠️ nvidia-smi not found, checking torch...", flush=True)
 
 # Install dependencies one at a time with error handling
 for pkg in ["brotli", "zstandard", "sentencepiece"]:
