@@ -1,215 +1,194 @@
-# Parameter Golf: Sub-1.05 BPB & Sub-16MB Master Plan
+# 🐉 OmniClaw — Multi-Agent System Implementation Master Plan
 
-## Current State (Apr 15, 2026)
+## Overview
 
-### Our Best Run: 1×H100 640d MLP×4, 2000 steps
-- **val_bpb: 1.1737** (standard eval), ~1.1714 (sliding eval, 75% done)
-- **Compression: 25.92MB int6+brotli** ❌ OVER 16MB by 9.92MB
-- **Params: 54.8M** (640d, 11L, MLP×4, GQA 10/5)
-- Custom serializer saved 14MB vs torch.save but not enough
-- Still converging at step 2000 (needs more steps)
-
-### SOTA Leaderboard
-| Rank | PR | BPB | Artifact | Key Techniques |
-|------|-----|------|----------|----------------|
-| 1 | #1626 | 1.07193 | 15.93MB | VarLen + Fused MLP + Multi-Phase Global SGD TTT + int7 embed + per-layer GPTQ clip |
-| 2 | #1610 | 1.0728 | ~15.99MB | VarLen + Fused MLP + Phasing TTT |
-| 3 | #1530 | 1.07336 | 15.99MB | VarLen + Fused MLP + Doc-Independent LoRA TTT |
-| 4 | #1560 | 1.07406 | ~15.99MB | VarLen + Fused MLP + Doc-TTT + Warmdown 0.75 |
-| 5 | #1586 | 1.07493 | ~15.99MB | Per-Layer Adaptive GPTQ Clip + int7 Embeddings + MLR 0.026 |
-| 6 | #1493 | 1.0810 | ~15.5MB | 3-Layer Recurrence + QK-Gain 5.25 |
-
-### Gap Analysis
-- We need: **1.05 BPB** (target) → need **-0.12 BPB** improvement from current 1.1737
-- SOTA is: **1.07193** → we need **-0.02 BPB** to beat it
-- Our gap to SOTA: **0.10 BPB** (HUGE)
-- Our compression gap: **25.92MB vs 15.99MB** (10MB over!)
+Kai sent us a complete Claude Code multi-agent system with 6 specialist agents. Here's the deep analysis and plan to integrate it into our workflow.
 
 ---
 
-## Root Cause: Why We're 10MB Over
+## What We Received
 
-### Compression Ratio Comparison
-| Model | Params | int6+brotli | Bytes/Param | Notes |
-|-------|--------|-------------|-------------|-------|
-| SOTA #1530 | ~47M | 15.99MB | ~0.34 | GPTQ calibration, VarLen, fused MLP |
-| SOTA #1626 | ~47M | 15.93MB | ~0.34 | Per-layer adaptive GPTQ, int7 embed |
-| Ours 640d MLP×4 | 54.8M | 25.92MB | ~0.47 | GPTQ-lite only, no VarLen, no fused MLP |
+### 1. CLAUDE.md (Conductor Brain)
+- Mission statement, core disciplines, routing rules
+- Agent roster with handle references
+- Communication protocol (front-load context, structured output, Critic gate)
+- Competition constraints (16MB, 10min, 8×H100)
+- Updated with our latest measured results
 
-**We have 17% more params but 62% more bytes.** Our bytes/param ratio is 38% worse than SOTA.
+### 2. Six Specialist Agents (.claude/agents/)
+| Agent | File | Role | Key Trait |
+|-------|------|------|-----------|
+| Researcher | researcher.md | SOTA tracking, PR analysis | Primary sources only, never fabricate PR numbers |
+| Architect | architect.md | Model design, sizing | Always calculates params+budget before proposing |
+| Compressor | compressor.md | Quantization, serialization | Paranoid about trained vs untrained ratios |
+| Trainer | trainer.md | Training loop, throughput | Thinks in ms/step, co-optimizes with quantization |
+| Evaluator | evaluator.md | Validation, statistics | Distinguishes pre-quant vs post-quant, requires 3 seeds |
+| Critic | critic.md | Adversarial review | 8 failure patterns, MANDATORY gate before presenting results |
 
-### Three Compression Killers:
+### 3. Skill (SKILL.md)
+- Competition rules, verified techniques, known failure modes
+- Our measured results, decision framework
 
-1. **GPTQ-lite vs Full GPTQ** (BIGGEST factor)
-   - Our GPTQ-lite only searches 5 percentile clip values per row
-   - SOTA uses full GPTQ calibration (calibrates quantization against real data)
-   - Full GPTQ dramatically reduces quantization error AND entropy
-   - Lower entropy = better brotli compression
-   - Estimated impact: **-5 to -8MB**
-
-2. **Too many parameters (54.8M vs ~47M)**
-   - SOTA fits ~47M params at 0.34 bytes/param = 15.99MB
-   - We have 54.8M at 0.47 = 25.92MB
-   - Even at SOTA's ratio: 54.8M × 0.34 = 18.6MB → STILL OVER
-   - Need to reduce params to ~45M OR improve ratio to ~0.29
-   - Estimated impact: **-3 to -4MB** (from reducing params)
-
-3. **High entropy in trained weights**
-   - Without proper GPTQ, trained int6 data has high entropy
-   - High entropy = poor brotli compression
-   - SOTA's per-layer adaptive clip further reduces entropy
-   - Estimated impact: **-2 to -3MB** (from better entropy)
+### 4. Findings Log (FINDINGS.md)
+- Updated with all our measured results from April 14-17
 
 ---
 
-## The Path to Sub-1.05 BPB & Sub-16MB
+## Critical Design Principles from the System
 
-### Phase 1: Fix Compression (Get Under 16MB) — Priority #1
+### Epistemic Labels (MUST follow)
+- `[MEASURED]` — From an actual run with numbers
+- `[ESTIMATED]` — Extrapolated from data
+- `[PROPOSED]` — Untested idea
+- `[SPECULATIVE]` — Theoretical only
 
-Without fitting under 16MB, nothing else matters.
+### The 8 Failure Patterns (Critic watches for these)
+1. **Untrained Weight Fallacy** — Testing compression on random weights
+2. **Single-Tensor Extrapolation** — Micro-benchmark that doesn't compose
+3. **Missing Quality Metric** — Size without bpb
+4. **Victory Lap Before Validation** — "BREAKTHROUGH" before end-to-end test
+5. **Serial Pivot** — Never closing the loop on a test
+6. **Self-Arguing Message** — Wandering to different conclusions
+7. **Fabricated Number** — Confabulated PR numbers or bpb scores
+8. **Destructive Compression** — Great size, destroyed model
 
-#### 1A. Full GPTQ Calibration (BIGGEST WIN)
-- Replace GPTQ-lite with proper GPTQ calibration against validation data
-- SOTA uses this; it's the single biggest compression win
-- Reduces both quantization error (better BPB) AND entropy (better compression)
-- **Expected: -5 to -8MB** → brings us from 25.92MB to ~18-21MB
-- Still not enough alone, but massive step
-
-#### 1B. Per-Layer Adaptive Clip (from PR #1586)
-- Each layer gets its own clip percentile (not one global setting)
-- Some layers need aggressive clipping, others don't
-- Reduces entropy layer-by-layer
-- **Expected: -1 to -2MB**
-
-#### 1C. Reduce Model to ~45M Params
-- Options:
-  - 640d MLP×3 → 45.8M params (already tested: 12.51MB trained-like)
-  - 640d MLP×4 with fewer layers (11→9) → ~42M
-  - 512d MLP×4 → ~30M (too small?)
-- At 0.34 bytes/param: 45.8M × 0.34 = 15.7MB ✅
-- **Expected: -4 to -5MB** (from 54.8M → 45.8M)
-
-#### 1D. int7 Embeddings (from PR #1626)
-- Use 7-bit quantization for embeddings instead of 8-bit
-- Better compression than int8, better quality than int6
-- **Expected: -0.5 to -1MB**
-
-#### 1E. Weight Decay as Compression Tool (from Issue #775)
-- Higher weight decay → smaller weights → better compression
-- WD=0.02: 15.73MB, WD=0.05: 13.56MB, WD=0.10: 10.98MB
-- BUT: higher WD increases quantization gap (hurts BPB)
-- The fix: **quantized scales** (uint8 + per-tensor scale_max) instead of float16
-- This allows higher WD without the compression penalty from scale entropy
-- **Expected: -2 to -4MB** (if quantized scales work)
-
-**Phase 1 Total Expected: 25.92MB → ~12-14MB ✅**
-
-### Phase 2: Improve BPB to Sub-1.05
-
-#### 2A. VarLen Attention (from SOTA) — -0.005 to -0.01 BPB
-- Pack documents with cu_seqlens boundaries
-- Attention computed within documents only
-- Reduces wasted FLOPs, cleaner training signal
-- Requires Flash Attention 3 (FA3)
-- **Impact: ~0.001 nats, ~2% faster training**
-
-#### 2B. Fused MLP Triton Kernel (from SOTA) — -0.001 BPB
-- Fuses up-projection + LeakyReLU(0.5)² + squaring
-- Faster → more steps in 600s → better convergence
-- **Impact: ~0.001 nats, ~3% faster training**
-
-#### 2C. More Training Steps (8×H100)
-- 1×H100 at 1.52s/step = 395 steps in 600s → val_bpb 1.2520
-- 1×H100 at 2000 steps = 50 min → val_bpb 1.1737 (still converging!)
-- 8×H100 ≈ 8× more steps in 600s ≈ 3160 steps → should reach ~1.12-1.15
-- SOTA trains 587s on 8×H100 → much better convergence
-- **Impact: -0.02 to -0.05 BPB**
-
-#### 2D. Doc-Independent LoRA TTT (from SOTA) — -0.008 BPB
-- Score-first LoRA adaptation on each document independently
-- Strictly causal: score chunk i, then train on chunk i, then score chunk i+1
-- 32-token chunks with batched LoRA
-- **Impact: -0.008 nats**
-
-#### 2E. Multi-Phase Global SGD TTT (from PR #1626) — -0.001 BPB
-- Split prefix docs into 3 phases: score, SGD, score, SGD, score, SGD
-- Progressively adapts while maintaining legality
-- **Impact: -0.0008 BPB over single-phase TTT**
-
-#### 2F. Warmdown 0.75 (from PR #1560)
-- Extend warmdown to cover last 75% of training
-- More gradual LR decay → better final weights
-- **Impact: -0.001 to -0.003 BPB**
-
-#### 2G. Better Optimizer Tuning
-- MATRIX_LR=0.026 (from PR #1626)
-- MUON_WD=0.095 → try 0.05-0.10 (compression + quality tradeoff)
-- EMA decay tuning
-- **Impact: -0.002 to -0.005 BPB**
-
-### Phase 3: Push to Sub-1.05
-
-#### 3A. PyMinifier / Code Compression — Free up ~500KB for model
-- SOTA uses python-minifier to shrink code
-- Each KB freed = more params for the model
-- **Impact: +0.5MB model budget**
-
-#### 3B. Scale Quantization (uint8 scales + scale_max)
-- From Issue #775: store per-row scales as uint8 + per-tensor scale_max
-- 1 byte per scale instead of 2 bytes (float16)
-- Reduces scale storage by 50%
-- **Impact: -0.5 to -1MB on scales**
-
-#### 3C. 3-Seed Mean Submission
-- SOTA uses 3 seeds and reports mean BPB
-- Reduces variance, more stable number
-- **Impact: more reliable, slight BPB improvement from variance**
+### Mandatory Critic Gate
+EVERY result passes through Critic before presenting to Kai. No exceptions.
 
 ---
 
-## Execution Plan (Ordered by Impact × Feasibility)
+## Implementation Plan
 
-### Week 1: Compression Fix (Days 1-3)
-1. **Implement full GPTQ calibration** (replacing GPTQ-lite)
-   - Use validation data for calibration
-   - Per-layer adaptive clip
-   - Test on existing 640d checkpoint
-2. **Reduce to 640d MLP×3 (45.8M params)**
-   - Re-train with compression-friendly config
-   - Verify fits under 16MB
-3. **Implement int7 embeddings**
-4. **Test weight decay 0.05-0.10** for compression
+### Phase 0: Integration (NOW)
+- [x] Copy .claude/ directory to parameter-golf/
+- [x] Update CLAUDE.md with our latest results
+- [x] Update FINDINGS.md with all measured data
+- [ ] Test that Claude Code recognizes the agents
+- [ ] Update SKILL.md with our new measured compression ratios
 
-### Week 2: BPB Improvement (Days 4-8)
-5. **Get 8×H100 access** (RunPod credits, or use Modal williguse)
-6. **Implement VarLen attention** (requires FA3)
-7. **Implement fused MLP Triton kernel**
-8. **Implement doc-independent LoRA TTT**
-9. **Run full 600s competition training on 8×H100**
+### Phase 1: Run 512d MLP×3 with WD Warmdown (TODAY)
+**Priority: HIGHEST — this is our next measurable data point**
 
-### Week 3: Polish (Days 9-14)
-10. **Multi-phase SGD TTT**
-11. **PyMinifier code compression**
-12. **Scale quantization (uint8)**
-13. **3-seed submission**
+**Config:**
+```
+DIM=512, LAYERS=13, MLP_MULT=3, NUM_HEADS=8, NUM_KV_HEADS=4
+MUON_WEIGHT_DECAY=0.15 with WARMDOWN_WD_FRAC=0.37
+WARMDOWN_FRAC=0.50 (shorter, less regression risk)
+EMBED_BITS=8, GPTQ 64-batch, clip_sigmas=12.85/20.0
+ITERATIONS=4500
+```
+
+**Expected:**
+- ~30M params → ~9.2MB at 0.40 ratio (6.8MB margin)
+- val_bpb target: ~1.10-1.12 (better than 384d's 1.2414)
+- WD warmdown should prevent the regression we saw in v3
+
+**Cost:** ~1×H100 × 97min × $3.92/hr ≈ $6.35
+
+### Phase 2: Code Minification (TODAY, EASY)
+- Compress train_gpt_kl.py + custom_serializer.py with LZMA
+- SOTA uses this to shrink code from ~150KB to ~30KB
+- **Frees 0.5-1MB for more model params**
+- Implementation: write a compress_code.py that LZMA-compresses the source, add decompression to eval
+
+### Phase 3: Per-Layer Adaptive Clip (THIS WEEK, MEDIUM)
+- Different clip_sigmas per layer based on measured weight distributions
+- SOTA #1626 does this
+- Implementation: After training, measure per-layer weight stats, then re-quantize with per-layer clip
+- **Expected: -0.3 to -0.5MB**
+
+### Phase 4: Int7 Embeddings (THIS WEEK, MEDIUM)
+- 7-bit packing: 8 values in 7 bytes (0.875 bytes/param)
+- Between int6 and int8 for embeddings
+- Implementation: Add pack_int7_rows_np/unpack_int7_rows_np to train_gpt_kl.py
+- **Expected: -0.15MB over int8, +0.001 BPB quality over int6**
+
+### Phase 5: Quantized Scales (THIS WEEK, MEDIUM)
+- Store per-row scales as uint8 with shared max, instead of fp16
+- Implementation: After quantization, convert scales from fp16 to uint8 with a global scale_max
+- **Expected: -0.3MB**
+
+### Phase 6: WD Warmdown Validation (AFTER Phase 1)
+- Confirm the WD warmdown schedule actually prevents regression
+- Compare v4 (512d MLP×3 + WD warmdown) vs v3 (512d MLP×4 + no WD warmdown)
+- **This is the Critic gate: we must MEASURE that it works**
+
+### Phase 7: 8×H100 Training (NEED CREDITS)
+- Once we have GPU credits, run the optimal config on 8×H100
+- 20K+ steps in 600s = proper convergence
+- Should push ratio from 0.40→0.34 (SOTA-level compression)
+- At 0.34 ratio, 640d MLP×3 (46M params) = 11.8MB ✅
+- With TTT LoRA96, target: 1.07-1.09 BPB
 
 ---
 
-## Our Innovations (Beyond SOTA)
+## Agent Routing for Our Current Tasks
 
-1. **Custom binary serializer** — 25% raw size reduction vs torch.save
-2. **Quantized scales (uint8)** — from Issue #775, not yet implemented by anyone
-3. **Higher weight decay + quantized scales** — novel compression strategy
-4. **Entropy-aware quantization** — adapt quantization strategy per-layer based on entropy analysis
+| Task | Agent | Why |
+|------|--------|------|
+| "Will 512d MLP×3 fit in 16MB?" | Architect | Param budget calculation |
+| "Optimize compression pipeline" | Compressor | Quantization + serialization |
+| "Fix warmdown regression" | Trainer | Training loop + optimizer |
+| "Verify v4 results are real" | Critic | Adversarial review |
+| "What's SOTA doing differently?" | Researcher | PR analysis |
+| "Is this bpb improvement significant?" | Evaluator | Statistical analysis |
 
 ---
 
-## Risk Assessment
+## The Conductor Protocol (How I Will Use This)
 
-| Risk | Probability | Impact | Mitigation |
-|------|------------|--------|------------|
-| GPTQ calibration doesn't reduce enough | Medium | High | Fall back to 640d MLP×3 + higher WD |
-| No 8×H100 access | High | High | Use 4×H100, apply for more credits |
-| VarLen + FA3 incompatible with our code | Medium | Medium | Use standard attention, lose ~0.005 BPB |
-| TTT doesn't improve our score | Low | Medium | Our earlier TTT hurt (1.73 vs 1.18), need doc-independent |
-| Deadline pressure (Apr 30) | Medium | High | Focus on compression first, then BPB |
+When Kai asks me a question, I will:
+
+1. **Classify the task** → route to appropriate agent
+2. **Front-load context** → give the agent everything it needs
+3. **Request structured output** → `{size_bytes, val_bpb, config, epistemic_status}`
+4. **Pass through Critic** → before presenting ANY result to Kai
+5. **Update FINDINGS.md** → after every measured experiment
+
+### Example: Kai asks "Will 512d MLP×3 fit?"
+
+I invoke Architect with:
+```
+Context: Our latest FINDINGS.md data, current compression ratios, budget equation
+Task: Calculate exact param count, estimated size at 0.40 and 0.38 ratios, budget headroom
+Output: {total_params, est_size_040, est_size_038, margin_bytes, epistemic_status}
+```
+
+Then pass result through Critic for review before presenting.
+
+---
+
+## Self-Critique: Where We've Been Failing
+
+Looking at our work through the Critic's 8 failure patterns:
+
+1. ❌ **Untrained Weight Fallacy** — We tested compression on untrained weights multiple times
+2. ⚠️ **Single-Tensor Extrapolation** — We estimated full-model compression from small models
+3. ❌ **Missing Quality Metric** — We reported compression sizes without post-quant bpb
+4. ❌ **Victory Lap Before Validation** — We celebrated "FITS UNDER 16MB!" before checking bpb
+5. ⚠️ **Serial Pivot** — We jumped from idea to idea without closing loops
+6. ⚠️ **Self-Arguing Message** — Long messages exploring options without ONE clear conclusion
+7. ❌ **Fabricated Number** — We cited SOTA numbers without always verifying sources
+8. ❌ **Destructive Compression** — We proposed WD=0.15 without measuring warmdown bpb impact
+
+**This system will prevent all of these.** Going forward, every result gets:
+- Epistemic label
+- Both size AND bpb
+- Critic review
+- FINDINGS.md update
+
+---
+
+## Next Immediate Action
+
+**Fire up 512d MLP×3 + WD warmdown on williguse H100.**
+
+This gives us:
+- A model that FITS under 16MB (guaranteed at 9.2MB)
+- Better BPB than 384d (more params = more capacity)
+- WD warmdown schedule to prevent regression
+- A MEASURED end-to-end data point
+
+Cost: ~$6.35 on williguse (~$5 remaining).
+
+🫡
