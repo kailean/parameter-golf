@@ -2,7 +2,7 @@
 """
 KaiLean's Parameter Golf — CUDA/PyTorch version
 Based on stock train_gpt.py with the following innovations:
-  1. BigramHashEmbedding  — disabled by default for SP8192 (BIGRAM_HASH_SIZE=0)
+  1. BigramHashEmbedding  — hash-based bigram logit features (BIGRAM_HASH_SIZE=10240)
   2. Int6 QAT with STE    — fake-quant during training (QAT_START_FRAC=0.15)
   3. EMA weight averaging — replaces SWA (EMA_DECAY=0.995, EMA_START_FRAC=0.5)
   4. OrthoInit            — SVD orthogonal init for Q/K/V/fc matrices (USE_ORTHO_INIT=1)
@@ -44,10 +44,10 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 # ─────────────────────────────────────────────────────────────
 
 class Hyperparameters:
-    data_path       = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp8192")
+    data_path       = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp1024")
     train_files     = os.path.join(data_path, "fineweb_train_*.bin")
     val_files       = os.path.join(data_path, "fineweb_val_*.bin")
-    tokenizer_path  = os.environ.get("TOKENIZER_PATH", "./data/tokenizers/fineweb_8192_bpe.model")
+    tokenizer_path  = os.environ.get("TOKENIZER_PATH", "./data/tokenizers/fineweb_1024_bpe.model")
     run_id          = os.environ.get("RUN_ID", str(uuid.uuid4()))
     seed            = int(os.environ.get("SEED", 1337))
 
@@ -60,8 +60,6 @@ class Hyperparameters:
     # SOTA: long warmdown over 72% of the run; WARMDOWN_ITERS still overrides.
     warmdown_frac       = float(os.environ.get("WARMDOWN_FRAC", 0.72))
     warmdown_iters      = int(os.environ.get("WARMDOWN_ITERS", int(iterations * warmdown_frac)))
-    # SOTA fix: decay WD during warmdown to prevent regression (0.37 = decay from 0.15 → 0.095)
-    warmdown_wd_frac    = float(os.environ.get("WARMDOWN_WD_FRAC", 0.37))
     warmup_steps        = int(os.environ.get("WARMUP_STEPS", 20))
     train_batch_tokens  = int(os.environ.get("TRAIN_BATCH_TOKENS", 786_432))
     train_seq_len       = int(os.environ.get("TRAIN_SEQ_LEN", 2048))
@@ -73,7 +71,7 @@ class Hyperparameters:
     qk_gain_init        = float(os.environ.get("QK_GAIN_INIT", 5.0))
 
     # SOTA model shape — 13 layers, DIM=512, MLP×4, 8 query heads / 4 KV heads.
-    vocab_size      = int(os.environ.get("VOCAB_SIZE", 8192))
+    vocab_size      = int(os.environ.get("VOCAB_SIZE", 1024))
     num_layers      = int(os.environ.get("NUM_LAYERS", os.environ.get("LAYERS", 13)))
     num_kv_heads    = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim       = int(os.environ.get("MODEL_DIM", os.environ.get("DIM", 512)))
@@ -85,7 +83,7 @@ class Hyperparameters:
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
 
     # KL innovations
-    bigram_hash_size = int(os.environ.get("BIGRAM_HASH_SIZE", 0))
+    bigram_hash_size = int(os.environ.get("BIGRAM_HASH_SIZE", 16384))
     qat_start_frac   = float(os.environ.get("QAT_START_FRAC", 0.15))  # UNUSED — late_qat_threshold controls QAT
     ema_decay        = float(os.environ.get("EMA_DECAY", 0.9965))
     ema_start_frac   = float(os.environ.get("EMA_START_FRAC", 0.5))
@@ -683,8 +681,16 @@ def eval_val_sliding_ttt(
     base_model = model.module if isinstance(model, DDP) else model
     base_model.eval()
 
-    # SOTA: LoRA targets Q + K + O + full MLP, never V.
-    lora_modules = collect_ttt_target_modules(base_model)
+    # SOTA: LoRA targets Q + K + O + full MLP, not Q + V.
+    lora_modules: list[tuple[str, CastedLinear]] = []
+    for li, block in enumerate(base_model.blocks):
+        lora_modules.extend([
+            (f"blocks.{li}.attn.c_q", block.attn.c_q),
+            (f"blocks.{li}.attn.c_k", block.attn.c_k),
+            (f"blocks.{li}.attn.proj", block.attn.proj),
+            (f"blocks.{li}.mlp.fc", block.mlp.fc),
+            (f"blocks.{li}.mlp.proj", block.mlp.proj),
+        ])
 
     ttt_rank = args.ttt_rank
     ttt_lr = args.ttt_lr
@@ -694,7 +700,6 @@ def eval_val_sliding_ttt(
     batch_seqs = args.ttt_batch if args.ttt_batch > 0 else batch_seqs
     persistent_adapters = None
     persistent_optimizer = None
-    chunk_schedule = build_ttt_phase_chunk_schedule(seq_len=seq_len, chunk_size=ttt_chunk, phases=ttt_steps)
 
     def create_lora_adapters():
         adapters = []
@@ -705,7 +710,7 @@ def eval_val_sliding_ttt(
             b = torch.zeros(ttt_rank, in_f, device=device, dtype=torch.float32, requires_grad=True)
             adapters.append((name, module, a, b))
             params.extend([a, b])
-        opt = torch.optim.Adam(
+        opt = torch.optim.AdamW(
             params,
             lr=ttt_lr,
             betas=(args.ttt_beta1, args.ttt_beta2),
@@ -781,8 +786,10 @@ def eval_val_sliding_ttt(
                     return None
                 return nll_seg[mask].mean()
 
-            # SOTA: global multi-phase score→adapt→score over every chunk.
-            for phase, chunk_start, chunk_end in chunk_schedule:
+            # SOTA: 3-phase score→adapt→score, one AdamW gradient step per phase.
+            for phase in range(ttt_steps):
+                chunk_start = phase * ttt_chunk
+                chunk_end = min(chunk_start + ttt_chunk, seq_len)
                 with torch.no_grad():
                     baseline_loss_t = score_chunk_loss(chunk_start, chunk_end)
                     baseline_loss = float("inf") if baseline_loss_t is None else float(baseline_loss_t.item())
@@ -1719,137 +1726,6 @@ class GPT(nn.Module):
         return logits  # (B, T, vocab)
 
 
-SOTA_SUBMISSION_LIMIT_BYTES = 16 * 1024 * 1024
-SOTA_ESTIMATED_INT6_BROTLI_RATIO = float(os.environ.get("ESTIMATED_INT6_BROTLI_RATIO", "0.4375"))
-_SOTA_EMBED_PATTERNS = ("tok_emb.weight", "lm_head.weight")
-
-
-def collect_ttt_target_modules(base_model: "GPT") -> list[tuple[str, CastedLinear]]:
-    """SOTA LoRA TTT targets: Q, K, O, and both MLP projections on every block."""
-    modules: list[tuple[str, CastedLinear]] = []
-    for li, block in enumerate(base_model.blocks):
-        modules.extend([
-            (f"blocks.{li}.attn.c_q", block.attn.c_q),
-            (f"blocks.{li}.attn.c_k", block.attn.c_k),
-            (f"blocks.{li}.attn.proj", block.attn.proj),
-            (f"blocks.{li}.mlp.fc", block.mlp.fc),
-            (f"blocks.{li}.mlp.proj", block.mlp.proj),
-        ])
-    return modules
-
-
-def build_ttt_phase_chunk_schedule(seq_len: int, chunk_size: int, phases: int) -> list[tuple[int, int, int]]:
-    """Repeat a full chunk sweep for each TTT phase so adaptation is global, not prefix-only."""
-    if seq_len <= 0:
-        return []
-    chunk = max(int(chunk_size), 1)
-    phase_count = max(int(phases), 1)
-    spans = [(start, min(start + chunk, seq_len)) for start in range(0, seq_len, chunk)]
-    return [(phase, start, end) for phase in range(phase_count) for start, end in spans]
-
-
-def estimate_quantized_payload_bytes(state_dict: dict[str, Tensor], embed_bits: int) -> int:
-    """Estimate the flat mixed int8/int6 payload before entropy compression."""
-    payload_bytes = 0
-    for name, tensor in state_dict.items():
-        numel = int(tensor.numel())
-        if not tensor.is_floating_point():
-            payload_bytes += numel * int(tensor.element_size())
-            continue
-        if numel <= INT6_KEEP_FLOAT_MAX_NUMEL:
-            if any(pattern in name for pattern in INT6_KEEP_FLOAT_FP32_NAME_PATTERNS):
-                payload_bytes += numel * torch.tensor([], dtype=torch.float32).element_size()
-            elif tensor.dtype in {torch.float32, torch.bfloat16}:
-                payload_bytes += numel * INT6_KEEP_FLOAT_STORE_DTYPE.itemsize
-            else:
-                payload_bytes += numel * int(tensor.element_size())
-            continue
-
-        quant_bits = 8 if embed_bits == 8 and any(pattern in name for pattern in _SOTA_EMBED_PATTERNS) else 6
-        if quant_bits == 8:
-            payload_bytes += numel
-        else:
-            payload_bytes += (numel * 6 + 7) // 8
-        payload_bytes += (int(tensor.shape[0]) * INT6_PER_ROW_SCALE_DTYPE.itemsize) if tensor.ndim == 2 else 4
-    return payload_bytes
-
-
-def build_sota_config_summary(args: Hyperparameters, model: GPT | None = None, code_bytes: int | None = None) -> dict[str, object]:
-    """Build an exact param-count summary plus a heuristic int6+brotli size estimate."""
-    working_model = model
-    if working_model is None:
-        working_model = GPT(
-            vocab_size=args.vocab_size,
-            num_layers=args.num_layers,
-            model_dim=args.model_dim,
-            num_heads=args.num_heads,
-            num_kv_heads=args.num_kv_heads,
-            mlp_mult=args.mlp_mult,
-            tie_embeddings=args.tie_embeddings,
-            tied_embed_init_std=args.tied_embed_init_std,
-            logit_softcap=args.logit_softcap,
-            rope_base=args.rope_base,
-            qk_gain_init=args.qk_gain_init,
-            bigram_hash_size=args.bigram_hash_size,
-            use_ortho_init=False,
-            smear_enabled=args.smear_enabled,
-            xsa_last_n=args.xsa_last_n,
-            rope_dims=args.rope_dims,
-            ln_scale_enabled=args.ln_scale_enabled,
-            depth_recurrence=args.depth_recurrence,
-            recurrence_layers=args.recurrence_layers,
-            recurrence_loops=args.recurrence_loops,
-            parallel_residuals=args.parallel_residuals,
-            parallel_res_start=args.parallel_res_start,
-            parallel_final_lane_mean=args.parallel_final_lane_mean,
-            leaky_slope=args.leaky_relu_slope,
-        )
-
-    state_dict = working_model.state_dict()
-    param_count = sum(int(param.numel()) for param in working_model.parameters())
-    embed_param_count = sum(
-        int(tensor.numel())
-        for name, tensor in state_dict.items()
-        if any(pattern in name for pattern in _SOTA_EMBED_PATTERNS)
-    )
-    estimated_payload_bytes = estimate_quantized_payload_bytes(state_dict, embed_bits=args.embed_bits)
-    estimated_int6_brotli_bytes = int(round(estimated_payload_bytes * SOTA_ESTIMATED_INT6_BROTLI_RATIO))
-    if code_bytes is None:
-        code_bytes = len(Path(__file__).read_bytes())
-    estimated_total_submission_bytes = estimated_int6_brotli_bytes + int(code_bytes)
-    submission_margin_bytes = SOTA_SUBMISSION_LIMIT_BYTES - estimated_total_submission_bytes
-    return {
-        "data_path": args.data_path,
-        "tokenizer_path": args.tokenizer_path,
-        "vocab_size": args.vocab_size,
-        "bigram_hash_size": args.bigram_hash_size,
-        "layers": args.num_layers,
-        "dim": args.model_dim,
-        "mlp_mult": args.mlp_mult,
-        "gqa": f"{args.num_heads}Q/{args.num_kv_heads}KV",
-        "xsa_layers": sum(1 for block in working_model.blocks if block.attn.use_xsa),
-        "param_count": param_count,
-        "embed_param_count": embed_param_count,
-        "non_embed_param_count": param_count - embed_param_count,
-        "estimated_payload_bytes": estimated_payload_bytes,
-        "estimated_int6_brotli_bytes": estimated_int6_brotli_bytes,
-        "estimated_total_submission_bytes": estimated_total_submission_bytes,
-        "submission_margin_bytes": submission_margin_bytes,
-        "parallel_final_lane": "mean" if args.parallel_final_lane_mean else "last",
-    }
-
-
-def format_sota_config_summary(summary: dict[str, object]) -> str:
-    return (
-        f"sota_config_summary: data={Path(str(summary['data_path'])).name} tokenizer={Path(str(summary['tokenizer_path'])).name} "
-        f"vocab={summary['vocab_size']} layers={summary['layers']} dim={summary['dim']} mlp_mult={summary['mlp_mult']} "
-        f"gqa={summary['gqa']} xsa_layers={summary['xsa_layers']} bigram_hash={summary['bigram_hash_size']} "
-        f"param_count={summary['param_count']:,} est_int6_brotli={summary['estimated_int6_brotli_bytes']:,}B "
-        f"est_total={summary['estimated_total_submission_bytes']:,}B margin={summary['submission_margin_bytes']:,}B "
-        f"parallel_final_lane={summary['parallel_final_lane']}"
-    )
-
-
 # ─────────────────────────────────────────────────────────────
 # TRAINING
 # ─────────────────────────────────────────────────────────────
@@ -1987,16 +1863,6 @@ def main() -> None:
         f"embed_clip_sigmas={args.embed_clip_sigmas} delta_rows={args.delta_encode_rows} "
         f"byte_shuffle_stride={args.byte_shuffle_stride} brotli_quality={args.brotli_quality}"
     )
-    sota_summary = build_sota_config_summary(args, model=base_model, code_bytes=len(code.encode("utf-8")))
-    log0(format_sota_config_summary(sota_summary))
-    log0(
-        f"sota_defaults: qk_gain_init={args.qk_gain_init} leaky_relu_slope={args.leaky_relu_slope} "
-        f"muon_wd={args.muon_weight_decay} embed_wd={args.embed_weight_decay} adam_wd={args.adam_weight_decay} "
-        f"warmdown_frac={args.warmdown_frac} late_qat_threshold={args.late_qat_threshold} val_loss_every={args.val_loss_every} "
-        f"ttt_rank={args.ttt_rank} ttt_chunk={args.ttt_chunk} ttt_batch={args.ttt_batch} "
-        f"ttt_betas=({args.ttt_beta1},{args.ttt_beta2}) ttt_wd={args.ttt_weight_decay} "
-        f"gptq_batches={args.gptq_calibration_batches}"
-    )
 
     # ── optimizer split ────────────────────────────────────────
     block_named_params = list(base_model.blocks.named_parameters())
@@ -2039,10 +1905,6 @@ def main() -> None:
         optimizers.insert(1, optimizer_head)
 
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
-    # SOTA fix: save base_weight_decay for WD warmdown schedule
-    for opt in optimizers:
-        for group in opt.param_groups:
-            group["base_weight_decay"] = group.get("weight_decay", 0.0)
     log0(
         f"iterations:{args.iterations} train_batch_tokens:{args.train_batch_tokens} "
         f"warmup_steps:{args.warmup_steps} warmdown_frac:{args.warmdown_frac} warmdown_iters:{args.warmdown_iters}"
@@ -2102,8 +1964,6 @@ def main() -> None:
     # ── main training loop ─────────────────────────────────────
     training_time_ms: float   = 0.0
     stop_after_step: int | None = None
-    best_val_bpb: float = float("inf")  # Track best val_bpb for early stopping / best checkpoint
-    best_step: int = 0
     # Innovation state
     use_qat_active: bool = False
     ema: EMABuffer | None = None
@@ -2142,15 +2002,6 @@ def main() -> None:
             if _avg is not None:
                 _avg.restore(base_model, saved_params)
 
-            # SOTA fix: track best val_bpb and save best EMA checkpoint
-            if val_bpb < best_val_bpb:
-                best_val_bpb = val_bpb
-                best_step = step
-                if _avg is not None and rank == 0:
-                    # Save best EMA state for later use
-                    torch.save(_avg.shadow, "best_ema_shadow.pt")
-                log0(f"best_val_bpb:{best_val_bpb:.4f} at step:{step}")
-
             torch.cuda.synchronize()
             t0 = time.perf_counter()
 
@@ -2167,32 +2018,6 @@ def main() -> None:
             est_total   = min(args.iterations, int(max_wallclock_ms / max(step_ms_avg, 1e-6)))
 
         scale = lr_mul(step, elapsed_ms)
-
-        # SOTA fix: decay WD during warmdown to prevent regression
-        # When LR is decaying, high WD pushes weights to zero and model "forgets"
-        # Solution: decay WD proportionally so LR can still update weights
-        if args.warmdown_wd_frac > 0 and max_wallclock_ms is None:
-            warmdown_start = max(args.iterations - args.warmdown_iters, 0)
-            if warmdown_start <= step < args.iterations:
-                wd_progress = (step - warmdown_start) / max(args.warmdown_iters, 1)
-                wd_decay = max(1.0 - wd_progress * args.warmdown_wd_frac, 1.0 - args.warmdown_wd_frac)
-            else:
-                wd_decay = 1.0
-        elif args.warmdown_wd_frac > 0 and max_wallclock_ms is not None:
-            # Wallclock-based warmdown: decay WD based on remaining time
-            if scale < 1.0:
-                wd_decay = max(scale, 1.0 - args.warmdown_wd_frac)
-            else:
-                wd_decay = 1.0
-        else:
-            wd_decay = 1.0
-
-        # Apply WD decay to optimizer param groups
-        if wd_decay < 1.0:
-            for opt in optimizers:
-                for group in opt.param_groups:
-                    if "weight_decay" in group and group["weight_decay"] > 0:
-                        group["weight_decay"] = group.get("base_weight_decay", group["weight_decay"]) * wd_decay
 
         # Toggle QAT when lr_mul drops below late_qat_threshold (warmdown-triggered)
         # Only check after warmup completes to avoid triggering during warmup ramp

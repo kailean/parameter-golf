@@ -31,7 +31,7 @@ MODEL_VOL = modal.Volume.from_name("parameter-golf-models", create_if_missing=Tr
 
 @app.function(
     image=image,
-    gpu=modal.gpu.H100(count=8),
+    gpu="H100",
     volumes={"/data": vol, "/models": MODEL_VOL},
     timeout=7200,
     memory=32768,
@@ -101,12 +101,12 @@ def train():
         "LOGIT_SOFTCAP": "30.0",
         "SEED": "1337",
         # Training schedule
-        "ITERATIONS": "20000",
+        "ITERATIONS": "4500",
         "TRAIN_BATCH_TOKENS": "786432",
         "TRAIN_SEQ_LEN": "2048",
         "WARMUP_STEPS": "20",
-        "WARMDOWN_ITERS": "3500",
-        "MAX_WALLCLOCK_SECONDS": "600",
+        "WARMDOWN_ITERS": "4000",
+        "MAX_WALLCLOCK_SECONDS": "0",      # No wallclock cap
         # Optimizer
         "OPTIMIZER": "muon",
         "MUON_MOMENTUM": "0.99",
@@ -139,7 +139,7 @@ def train():
         # CRITICAL: BigramHash OFF for SP8192
         "BIGRAM_HASH_SIZE": "0",
         # Eval settings
-        "VAL_LOSS_EVERY": "99999",  # Skip mid-training evals, only eval at end
+        "VAL_LOSS_EVERY": "500",
         "VAL_BATCH_SIZE": "524288",
         "TRAIN_LOG_EVERY": "50",
         "EVAL_SEQ_LEN": "2048",
