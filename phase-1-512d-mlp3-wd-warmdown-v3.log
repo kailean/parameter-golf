@@ -1,0 +1,24 @@
+[{"stream_name":"stdout","time":0.783985494,"data":"🔍 Checking GPU...\n"}
+,{"stream_name":"stdout","time":0.790900457,"data":"  ⚠️ nvidia-smi not found, checking torch...\n"}
+,{"stream_name":"stdout","time":0.790930837,"data":"📦 Installing brotli...\n"}
+,{"stream_name":"stdout","time":5.8113116940000005,"data":"📦 Installing zstandard...\n"}
+,{"stream_name":"stdout","time":8.467729642,"data":"📦 Installing sentencepiece...\n"}
+,{"stream_name":"stdout","time":14.39407401,"data":"  PyTorch: 2.10.0+cpu, CUDA: False\n"}
+,{"stream_name":"stdout","time":14.39413756,"data":"📥 Cloning repo...\n"}
+,{"stream_name":"stdout","time":15.992827091,"data":"  ✅ Cloned to /kaggle/working/parameter-golf\n"}
+,{"stream_name":"stdout","time":15.992865701,"data":"📥 Downloading SP8192 data...\n"}
+,{"stream_name":"stdout","time":16.568079707,"data":"  Data download FAILED: Traceback (most recent call last):\n"}
+,{"stream_name":"stdout","time":16.568143597,"data":"  File \"/kaggle/working/parameter-golf/data/cached_challenge_fineweb.py\", line 157, in \u003cmodule\u003e\n"}
+,{"stream_name":"stdout","time":16.568148687,"data":"    main()\n"}
+,{"stream_name":"stdout","time":16.568151607,"data":"  File \"/kaggle/working/parameter-golf/data/cached_challenge_fineweb.py\", line 127, in main\n"}
+,{"stream_name":"stdout","time":16.568154617,"data":"    manifest = load_manifest(skip_manifest_download=args.skip_manifest)\n"}
+,{"stream_name":"stdout","time":16.568157357,"data":"               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n"}
+,{"stream_name":"stdout","time":16.568160257,"data":"  File \"/kaggle/working/parameter-golf/data/cached_challenge_fineweb.py\", line 69, in load_manifest\n"}
+,{"stream_name":"stdout","time":16.568163137,"data":"    raise FileNotFound\n"}
+,{"stream_name":"stderr","time":19.232599179,"data":"/usr/local/lib/python3.12/dist-packages/mistune.py:435: SyntaxWarning: invalid escape sequence '\\|'\n"}
+,{"stream_name":"stderr","time":19.232650879,"data":"  cells[i][c] = re.sub('\\\\\\\\\\|', '|', cell)\n"}
+,{"stream_name":"stderr","time":19.553863379,"data":"/usr/local/lib/python3.12/dist-packages/nbconvert/filters/filter_links.py:36: SyntaxWarning: invalid escape sequence '\\_'\n"}
+,{"stream_name":"stderr","time":19.55389723,"data":"  text = re.sub(r'_', '\\_', text) # Escape underscores in display text\n"}
+,{"stream_name":"stderr","time":20.165582199,"data":"[NbConvertApp] Converting notebook __script__.ipynb to html\n"}
+,{"stream_name":"stderr","time":21.543286987,"data":"[NbConvertApp] Writing 308842 bytes to __results__.html\n"}
+]

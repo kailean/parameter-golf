@@ -1,0 +1,20 @@
+[{"stream_name":"stdout","time":0.911359041,"data":"🔍 Checking GPU...\n"}
+,{"stream_name":"stderr","time":0.919502249,"data":"Traceback (most recent call last):\n"}
+,{"stream_name":"stderr","time":0.919570279,"data":"  File \"/kaggle/src/script.py\", line 24, in \u003cmodule\u003e\n"}
+,{"stream_name":"stderr","time":0.919720079,"data":"    r = subprocess.run([\"nvidia-smi\", \"--query-gpu=name,memory.total\", \"--format=csv,noheader\"], capture_output=True, text=True)\n"}
+,{"stream_name":"stderr","time":0.919919919,"data":"        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n"}
+,{"stream_name":"stderr","time":0.919930399,"data":"  File \"/usr/lib/python3.12/subprocess.py\", line 548, in run\n"}
+,{"stream_name":"stderr","time":0.922144909,"data":"    with Popen(*popenargs, **kwargs) as process:\n"}
+,{"stream_name":"stderr","time":0.922177439,"data":"         ^^^^^^^^^^^^^^^^^^^^^^^^^^^\n"}
+,{"stream_name":"stderr","time":0.922211899,"data":"  File \"/usr/lib/python3.12/subprocess.py\", line 1026, in __init__\n"}
+,{"stream_name":"stderr","time":0.922672678,"data":"    self._execute_child(args, executable, preexec_fn, close_fds,\n"}
+,{"stream_name":"stderr","time":0.922704409,"data":"  File \"/usr/lib/python3.12/subprocess.py\", line 1955, in _execute_child\n"}
+,{"stream_name":"stderr","time":0.922930138,"data":"    raise child_exception_type(errno_num, err_msg, err_filename)\n"}
+,{"stream_name":"stderr","time":0.922936729,"data":"FileNotFoundError: [Errno 2] No such file or directory: 'nvidia-smi'\n"}
+,{"stream_name":"stderr","time":3.627590708,"data":"/usr/local/lib/python3.12/dist-packages/mistune.py:435: SyntaxWarning: invalid escape sequence '\\|'\n"}
+,{"stream_name":"stderr","time":3.627654878,"data":"  cells[i][c] = re.sub('\\\\\\\\\\|', '|', cell)\n"}
+,{"stream_name":"stderr","time":4.043011642,"data":"/usr/local/lib/python3.12/dist-packages/nbconvert/filters/filter_links.py:36: SyntaxWarning: invalid escape sequence '\\_'\n"}
+,{"stream_name":"stderr","time":4.043066281,"data":"  text = re.sub(r'_', '\\_', text) # Escape underscores in display text\n"}
+,{"stream_name":"stderr","time":5.592511081,"data":"[NbConvertApp] Converting notebook __script__.ipynb to html\n"}
+,{"stream_name":"stderr","time":7.159246765,"data":"[NbConvertApp] Writing 307807 bytes to __results__.html\n"}
+]
