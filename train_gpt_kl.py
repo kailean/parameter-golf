@@ -2401,7 +2401,7 @@ def main() -> None:
                 log0(f"graduated_qat_phase2_int8:step={step} frac={step_frac:.2f} — recompiled")
             # Phase 3: int6 (upgrade from int8 at int6_frac)
             # This requires a second recompile — handled below
-        elif not use_qat_active and step > args.warmup_steps and scale < args.late_qat_threshold:
+        elif not use_qat_active and step > args.warmup_steps and lr_mul(step, elapsed_ms) < args.late_qat_threshold:
             use_qat_active = True
             qat_phase = 6
             for m in base_model.modules():
