@@ -1266,7 +1266,7 @@ def main() -> None:
             est_total   = min(args.iterations, int(max_wallclock_ms / max(step_ms_avg, 1e-6)))
 
         # Toggle QAT when lr_mul drops below late_qat_threshold (warmdown-triggered)
-        if not use_qat_active and scale < args.late_qat_threshold:
+        if not use_qat_active and lr_mul(step, elapsed_ms) < args.late_qat_threshold:
             use_qat_active = True
             for m in base_model.modules():
                 if isinstance(m, CastedLinear):
