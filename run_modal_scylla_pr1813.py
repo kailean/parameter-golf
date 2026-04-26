@@ -71,10 +71,9 @@ def normalize_scylla_layout(root: Path) -> None:
 
 
 def install_reference_tokenizer(reference_dir: Path, root: Path) -> None:
-    corrected_dir = root / "amarck_scylla" / "datasets" / "fineweb10B_scylla_v2"
     sources = {
-        "candidate.vocab": corrected_dir / "scylla_corrected.vocab",
-        "candidate.meta.npz": corrected_dir / "scylla_corrected.meta.npz",
+        "candidate.vocab": reference_dir / "candidate.vocab",
+        "candidate.meta.npz": reference_dir / "candidate.pr1813_compat.meta.npz",
     }
     if not all(path.is_file() for path in sources.values()):
         sources = {
@@ -99,6 +98,7 @@ image = (
     .add_local_file("frontier_sources/scylla_pr1813/train_gpt.py", TRAIN_SCRIPT_REMOTE, copy=True)
     .add_local_file("frontier_sources/scylla_pr1813/candidate.vocab", "/workspace/pg/reference_tokenizer/candidate.vocab", copy=True)
     .add_local_file("frontier_sources/scylla_pr1813/candidate.meta.npz", "/workspace/pg/reference_tokenizer/candidate.meta.npz", copy=True)
+    .add_local_file("frontier_sources/scylla_pr1813/candidate.pr1813_compat.meta.npz", "/workspace/pg/reference_tokenizer/candidate.pr1813_compat.meta.npz", copy=True)
     .add_local_file("scripts/check_scylla_assets.py", "/workspace/pg/scripts/check_scylla_assets.py", copy=True)
     .add_local_file("scripts/check_scylla_artifact.py", "/workspace/pg/scripts/check_scylla_artifact.py", copy=True)
     .add_local_file("scripts/preflight_scylla.py", "/workspace/pg/scripts/preflight_scylla.py", copy=True)

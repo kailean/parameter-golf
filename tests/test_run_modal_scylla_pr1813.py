@@ -32,6 +32,7 @@ def test_install_reference_tokenizer_overrides_hf_symlinks(tmp_path):
     reference.mkdir()
     (reference / "candidate.vocab").write_text("pr", encoding="utf-8")
     (reference / "candidate.meta.npz").write_bytes(b"pr-meta")
+    (reference / "candidate.pr1813_compat.meta.npz").write_bytes(b"pr1813-meta")
     (root / "tokenizer").mkdir(parents=True)
     (root / "tokenizer" / "candidate.vocab").write_text("hf", encoding="utf-8")
     (root / "tokenizer" / "candidate.meta.npz").write_bytes(b"hf-meta")
@@ -70,7 +71,7 @@ def test_normalize_scylla_layout_prefers_amarck_source(tmp_path):
     assert (tmp_path / "datasets" / "fineweb10B_scylla").resolve() == amarck_dataset.resolve()
 
 
-def test_install_reference_tokenizer_prefers_corrected_amarck_meta(tmp_path):
+def test_install_reference_tokenizer_ignores_corrected_amarck_meta_when_pr1813_compat_exists(tmp_path):
     reference = tmp_path / "reference"
     root = tmp_path / "root"
     corrected = root / "amarck_scylla" / "datasets" / "fineweb10B_scylla_v2"
@@ -78,10 +79,11 @@ def test_install_reference_tokenizer_prefers_corrected_amarck_meta(tmp_path):
     corrected.mkdir(parents=True)
     (reference / "candidate.vocab").write_text("pr", encoding="utf-8")
     (reference / "candidate.meta.npz").write_bytes(b"pr-meta")
+    (reference / "candidate.pr1813_compat.meta.npz").write_bytes(b"pr1813-meta")
     (corrected / "scylla_corrected.vocab").write_text("corrected", encoding="utf-8")
     (corrected / "scylla_corrected.meta.npz").write_bytes(b"corrected-meta")
 
     install_reference_tokenizer(reference, root)
 
-    assert (root / "tokenizer" / "candidate.vocab").read_text(encoding="utf-8") == "corrected"
-    assert (root / "tokenizer" / "candidate.meta.npz").read_bytes() == b"corrected-meta"
+    assert (root / "tokenizer" / "candidate.vocab").read_text(encoding="utf-8") == "pr"
+    assert (root / "tokenizer" / "candidate.meta.npz").read_bytes() == b"pr1813-meta"
