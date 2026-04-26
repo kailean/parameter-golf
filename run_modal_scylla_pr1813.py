@@ -139,10 +139,23 @@ def smoke_environment() -> dict[str, str]:
     normalize_scylla_layout(Path("/data"))
     install_reference_tokenizer(Path("/workspace/pg/reference_tokenizer"), Path("/data"))
     subprocess.run([sys.executable, "/workspace/pg/scripts/check_scylla_assets.py", "--root", "/data"], check=True)
+    import numpy as np
+
     flash_spec = importlib.util.find_spec("flash_attn_interface")
+    val_path = Path("/data/datasets/fineweb10B_scylla/fineweb_val_000000.bin")
+    with np.load("/data/tokenizer/candidate.meta.npz", allow_pickle=False) as meta:
+        base_bytes = np.asarray(meta["base_bytes"], dtype=np.int64)
+    header_bytes = 256 * np.dtype("<i4").itemsize
+    n_tokens = (val_path.stat().st_size - header_bytes) // np.dtype("<u2").itemsize
+    val_tokens = np.memmap(val_path, mode="r", dtype="<u2", offset=header_bytes, shape=(n_tokens,))
+    token_count = int(n_tokens - 1)
+    byte_count = int(base_bytes[np.asarray(val_tokens[:-1], dtype=np.int64)].sum())
     return {
         "python": sys.version.split()[0],
         "flash_attn_interface": "present" if flash_spec else "missing",
+        "val_tokens": str(token_count),
+        "val_bytes": str(byte_count),
+        "tokens_per_byte": f"{token_count / byte_count:.9f}",
     }
 
 
