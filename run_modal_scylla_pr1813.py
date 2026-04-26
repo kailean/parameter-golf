@@ -12,7 +12,7 @@ from pathlib import Path
 import modal
 
 
-DATASET_REPO = "LightSpeedUp/parameter-golf-data"
+DATASET_REPO = "shikhar007/parameter-golf-scylla-data"
 APP_NAME = "parameter-golf-scylla-pr1813"
 VOLUME_NAME = "pg-scylla-pr1813-data"
 TRAIN_SCRIPT_REMOTE = "/workspace/pg/train_gpt.py"
@@ -45,26 +45,28 @@ def scylla_reference_env(seed: int, data_root: str = "/data") -> dict[str, str]:
 
 
 def normalize_scylla_layout(root: Path) -> None:
-    raw_dataset = root / "fineweb_scylla"
-    raw_tokenizer = root / "tokenizers" / "scylla"
+    dataset_candidates = [
+        root / "fineweb10B_scylla_raw",
+        root / "fineweb_scylla",
+        root / "datasets" / "fineweb10B_scylla",
+    ]
+    raw_dataset = next((path for path in dataset_candidates if path.is_dir()), None)
+    if raw_dataset is None:
+        searched = ", ".join(str(path) for path in dataset_candidates)
+        raise FileNotFoundError(f"missing downloaded Scylla dataset directory; searched: {searched}")
+
     dataset_target = root / "datasets" / "fineweb10B_scylla"
     tokenizer_target = root / "tokenizer"
-
-    if not raw_dataset.is_dir():
-        raise FileNotFoundError(f"missing downloaded dataset directory: {raw_dataset}")
-    if not raw_tokenizer.is_dir():
-        raise FileNotFoundError(f"missing downloaded tokenizer directory: {raw_tokenizer}")
-
     dataset_target.parent.mkdir(parents=True, exist_ok=True)
     tokenizer_target.mkdir(parents=True, exist_ok=True)
 
+    if dataset_target.is_symlink():
+        if dataset_target.resolve() != raw_dataset.resolve():
+            dataset_target.unlink()
+    elif dataset_target.exists() and dataset_target.resolve() != raw_dataset.resolve():
+        raise FileExistsError(f"dataset target exists and is not the selected Scylla source: {dataset_target}")
     if not dataset_target.exists():
         dataset_target.symlink_to(raw_dataset, target_is_directory=True)
-
-    for name in ("candidate.vocab", "candidate.meta.npz"):
-        dst = tokenizer_target / name
-        if not dst.exists():
-            dst.symlink_to(raw_tokenizer / name)
 
 
 def install_reference_tokenizer(reference_dir: Path, root: Path) -> None:
@@ -100,7 +102,7 @@ def download_scylla_data() -> str:
     import subprocess
 
     root = Path("/data")
-    marker = root / "datasets" / "fineweb10B_scylla" / "fineweb_train_000000.bin"
+    marker = root / "fineweb10B_scylla_raw" / "fineweb_train_000193.bin"
     meta = root / "tokenizer" / "candidate.meta.npz"
     if marker.is_file() and meta.is_file():
         normalize_scylla_layout(root)
@@ -116,9 +118,7 @@ def download_scylla_data() -> str:
             "--repo-type",
             "dataset",
             "--include",
-            "fineweb_scylla/*",
-            "--include",
-            "tokenizers/scylla/*",
+            "fineweb10B_scylla_raw/*",
             "--local-dir",
             str(root),
         ],

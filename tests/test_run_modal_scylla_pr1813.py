@@ -17,19 +17,13 @@ def test_scylla_reference_env_matches_pr1813():
 
 
 def test_normalize_scylla_layout_creates_expected_symlinks(tmp_path):
-    raw_dataset = tmp_path / "fineweb_scylla"
-    raw_tokenizer = tmp_path / "tokenizers" / "scylla"
+    raw_dataset = tmp_path / "fineweb10B_scylla_raw"
     raw_dataset.mkdir(parents=True)
-    raw_tokenizer.mkdir(parents=True)
     (raw_dataset / "fineweb_train_000000.bin").write_bytes(b"train")
-    (raw_tokenizer / "candidate.vocab").write_text("vocab", encoding="utf-8")
-    (raw_tokenizer / "candidate.meta.npz").write_bytes(b"meta")
 
     normalize_scylla_layout(tmp_path)
 
     assert (tmp_path / "datasets" / "fineweb10B_scylla" / "fineweb_train_000000.bin").is_file()
-    assert (tmp_path / "tokenizer" / "candidate.vocab").is_file()
-    assert (tmp_path / "tokenizer" / "candidate.meta.npz").is_file()
 
 
 def test_install_reference_tokenizer_overrides_hf_symlinks(tmp_path):
@@ -46,3 +40,18 @@ def test_install_reference_tokenizer_overrides_hf_symlinks(tmp_path):
 
     assert (root / "tokenizer" / "candidate.vocab").read_text(encoding="utf-8") == "pr"
     assert (root / "tokenizer" / "candidate.meta.npz").read_bytes() == b"pr-meta"
+
+
+def test_normalize_scylla_layout_replaces_stale_dataset_symlink(tmp_path):
+    old_dataset = tmp_path / "fineweb_scylla"
+    new_dataset = tmp_path / "fineweb10B_scylla_raw"
+    old_dataset.mkdir()
+    new_dataset.mkdir()
+    (new_dataset / "fineweb_train_000193.bin").write_bytes(b"train")
+    target_parent = tmp_path / "datasets"
+    target_parent.mkdir()
+    (target_parent / "fineweb10B_scylla").symlink_to(old_dataset, target_is_directory=True)
+
+    normalize_scylla_layout(tmp_path)
+
+    assert (target_parent / "fineweb10B_scylla").resolve() == new_dataset.resolve()
