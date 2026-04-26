@@ -143,17 +143,23 @@ def train(seed: int = 1337) -> dict[str, object]:
 
     log_path = workdir / f"scylla_seed{seed}.log"
     with log_path.open("w", encoding="utf-8") as log:
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             ["torchrun", "--standalone", "--nproc_per_node=8", TRAIN_SCRIPT_REMOTE],
             cwd=workdir,
             env=env,
             text=True,
-            stdout=log,
+            stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
+            bufsize=1,
         )
-    if proc.returncode != 0:
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            print(line, end="", flush=True)
+            log.write(line)
+        returncode = proc.wait()
+    if returncode != 0:
         tail = "\n".join(log_path.read_text(encoding="utf-8", errors="replace").splitlines()[-80:])
-        raise RuntimeError(f"training failed with exit code {proc.returncode}\n{tail}")
+        raise RuntimeError(f"training failed with exit code {returncode}\n{tail}")
 
     model = workdir / "final_model.int6.ptz"
     size_proc = subprocess.run(
