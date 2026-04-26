@@ -12,7 +12,7 @@ from pathlib import Path
 import modal
 
 
-DATASET_REPO = "shikhar007/parameter-golf-scylla-data"
+DATASET_REPO = "amarck/parameter-golf-scylla"
 APP_NAME = "parameter-golf-scylla-pr1813"
 VOLUME_NAME = "pg-scylla-pr1813-data"
 TRAIN_SCRIPT_REMOTE = "/workspace/pg/train_gpt.py"
@@ -46,6 +46,7 @@ def scylla_reference_env(seed: int, data_root: str = "/data") -> dict[str, str]:
 
 def normalize_scylla_layout(root: Path) -> None:
     dataset_candidates = [
+        root / "amarck_scylla" / "datasets" / "fineweb10B_scylla",
         root / "fineweb10B_scylla_raw",
         root / "fineweb_scylla",
         root / "datasets" / "fineweb10B_scylla",
@@ -102,7 +103,7 @@ def download_scylla_data() -> str:
     import subprocess
 
     root = Path("/data")
-    marker = root / "fineweb10B_scylla_raw" / "fineweb_train_000193.bin"
+    marker = root / "amarck_scylla" / "datasets" / "fineweb10B_scylla" / "fineweb_train_000193.bin"
     meta = root / "tokenizer" / "candidate.meta.npz"
     if marker.is_file() and meta.is_file():
         normalize_scylla_layout(root)
@@ -118,9 +119,9 @@ def download_scylla_data() -> str:
             "--repo-type",
             "dataset",
             "--include",
-            "fineweb10B_scylla_raw/*",
+            "datasets/fineweb10B_scylla/*",
             "--local-dir",
-            str(root),
+            str(root / "amarck_scylla"),
         ],
         check=True,
     )

@@ -55,3 +55,16 @@ def test_normalize_scylla_layout_replaces_stale_dataset_symlink(tmp_path):
     normalize_scylla_layout(tmp_path)
 
     assert (target_parent / "fineweb10B_scylla").resolve() == new_dataset.resolve()
+
+
+def test_normalize_scylla_layout_prefers_amarck_source(tmp_path):
+    old_dataset = tmp_path / "fineweb10B_scylla_raw"
+    amarck_dataset = tmp_path / "amarck_scylla" / "datasets" / "fineweb10B_scylla"
+    old_dataset.mkdir()
+    amarck_dataset.mkdir(parents=True)
+    (old_dataset / "fineweb_train_000193.bin").write_bytes(b"old")
+    (amarck_dataset / "fineweb_train_000193.bin").write_bytes(b"amarck")
+
+    normalize_scylla_layout(tmp_path)
+
+    assert (tmp_path / "datasets" / "fineweb10B_scylla").resolve() == amarck_dataset.resolve()
