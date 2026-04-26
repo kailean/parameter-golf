@@ -40,7 +40,7 @@ def test_install_reference_tokenizer_overrides_hf_symlinks(tmp_path):
     install_reference_tokenizer(reference, root)
 
     assert (root / "tokenizer" / "candidate.vocab").read_text(encoding="utf-8") == "pr"
-    assert (root / "tokenizer" / "candidate.meta.npz").read_bytes() == b"pr-meta"
+    assert (root / "tokenizer" / "candidate.meta.npz").read_bytes() == b"pr1813-meta"
 
 
 def test_normalize_scylla_layout_replaces_stale_dataset_symlink(tmp_path):
