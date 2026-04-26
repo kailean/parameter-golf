@@ -68,3 +68,20 @@ def test_normalize_scylla_layout_prefers_amarck_source(tmp_path):
     normalize_scylla_layout(tmp_path)
 
     assert (tmp_path / "datasets" / "fineweb10B_scylla").resolve() == amarck_dataset.resolve()
+
+
+def test_install_reference_tokenizer_prefers_corrected_amarck_meta(tmp_path):
+    reference = tmp_path / "reference"
+    root = tmp_path / "root"
+    corrected = root / "amarck_scylla" / "datasets" / "fineweb10B_scylla_v2"
+    reference.mkdir()
+    corrected.mkdir(parents=True)
+    (reference / "candidate.vocab").write_text("pr", encoding="utf-8")
+    (reference / "candidate.meta.npz").write_bytes(b"pr-meta")
+    (corrected / "scylla_corrected.vocab").write_text("corrected", encoding="utf-8")
+    (corrected / "scylla_corrected.meta.npz").write_bytes(b"corrected-meta")
+
+    install_reference_tokenizer(reference, root)
+
+    assert (root / "tokenizer" / "candidate.vocab").read_text(encoding="utf-8") == "corrected"
+    assert (root / "tokenizer" / "candidate.meta.npz").read_bytes() == b"corrected-meta"

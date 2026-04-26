@@ -71,10 +71,20 @@ def normalize_scylla_layout(root: Path) -> None:
 
 
 def install_reference_tokenizer(reference_dir: Path, root: Path) -> None:
+    corrected_dir = root / "amarck_scylla" / "datasets" / "fineweb10B_scylla_v2"
+    sources = {
+        "candidate.vocab": corrected_dir / "scylla_corrected.vocab",
+        "candidate.meta.npz": corrected_dir / "scylla_corrected.meta.npz",
+    }
+    if not all(path.is_file() for path in sources.values()):
+        sources = {
+            "candidate.vocab": reference_dir / "candidate.vocab",
+            "candidate.meta.npz": reference_dir / "candidate.meta.npz",
+        }
+
     tokenizer_target = root / "tokenizer"
     tokenizer_target.mkdir(parents=True, exist_ok=True)
-    for name in ("candidate.vocab", "candidate.meta.npz"):
-        src = reference_dir / name
+    for name, src in sources.items():
         if not src.is_file():
             raise FileNotFoundError(f"missing reference tokenizer file: {src}")
         dst = tokenizer_target / name
@@ -104,8 +114,9 @@ def download_scylla_data() -> str:
 
     root = Path("/data")
     marker = root / "amarck_scylla" / "datasets" / "fineweb10B_scylla" / "fineweb_train_000193.bin"
+    corrected_meta = root / "amarck_scylla" / "datasets" / "fineweb10B_scylla_v2" / "scylla_corrected.meta.npz"
     meta = root / "tokenizer" / "candidate.meta.npz"
-    if marker.is_file() and meta.is_file():
+    if marker.is_file() and corrected_meta.is_file() and meta.is_file():
         normalize_scylla_layout(root)
         install_reference_tokenizer(Path("/workspace/pg/reference_tokenizer"), root)
         vol.commit()
@@ -120,6 +131,8 @@ def download_scylla_data() -> str:
             "dataset",
             "--include",
             "datasets/fineweb10B_scylla/*",
+            "--include",
+            "datasets/fineweb10B_scylla_v2/scylla_corrected.*",
             "--local-dir",
             str(root / "amarck_scylla"),
         ],
