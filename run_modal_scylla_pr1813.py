@@ -126,7 +126,7 @@ def smoke_environment() -> dict[str, str]:
     }
 
 
-@app.function(image=image, volumes={"/data": vol}, gpu="H100:8", timeout=1200, cpu=32, memory=240_000)
+@app.function(image=image, volumes={"/data": vol}, gpu="H100:8", timeout=3600, cpu=32, memory=240_000)
 def train(seed: int = 1337) -> dict[str, object]:
     import re
     import subprocess
