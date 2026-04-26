@@ -67,10 +67,25 @@ def normalize_scylla_layout(root: Path) -> None:
             dst.symlink_to(raw_tokenizer / name)
 
 
+def install_reference_tokenizer(reference_dir: Path, root: Path) -> None:
+    tokenizer_target = root / "tokenizer"
+    tokenizer_target.mkdir(parents=True, exist_ok=True)
+    for name in ("candidate.vocab", "candidate.meta.npz"):
+        src = reference_dir / name
+        if not src.is_file():
+            raise FileNotFoundError(f"missing reference tokenizer file: {src}")
+        dst = tokenizer_target / name
+        if dst.exists() or dst.is_symlink():
+            dst.unlink()
+        dst.symlink_to(src)
+
+
 image = (
     modal.Image.from_registry("matotezitanka/proteus-pytorch:community")
     .pip_install("huggingface-hub", extra_options="--break-system-packages")
     .add_local_file("frontier_sources/scylla_pr1813/train_gpt.py", TRAIN_SCRIPT_REMOTE, copy=True)
+    .add_local_file("frontier_sources/scylla_pr1813/candidate.vocab", "/workspace/pg/reference_tokenizer/candidate.vocab", copy=True)
+    .add_local_file("frontier_sources/scylla_pr1813/candidate.meta.npz", "/workspace/pg/reference_tokenizer/candidate.meta.npz", copy=True)
     .add_local_file("scripts/check_scylla_assets.py", "/workspace/pg/scripts/check_scylla_assets.py", copy=True)
     .add_local_file("scripts/check_scylla_artifact.py", "/workspace/pg/scripts/check_scylla_artifact.py", copy=True)
     .add_local_file("scripts/preflight_scylla.py", "/workspace/pg/scripts/preflight_scylla.py", copy=True)
@@ -88,7 +103,10 @@ def download_scylla_data() -> str:
     marker = root / "datasets" / "fineweb10B_scylla" / "fineweb_train_000000.bin"
     meta = root / "tokenizer" / "candidate.meta.npz"
     if marker.is_file() and meta.is_file():
-        return "Scylla data already present"
+        normalize_scylla_layout(root)
+        install_reference_tokenizer(Path("/workspace/pg/reference_tokenizer"), root)
+        vol.commit()
+        return "Scylla data already present; PR1813 tokenizer metadata installed"
 
     subprocess.run(
         [
@@ -107,6 +125,7 @@ def download_scylla_data() -> str:
         check=True,
     )
     normalize_scylla_layout(root)
+    install_reference_tokenizer(Path("/workspace/pg/reference_tokenizer"), root)
     vol.commit()
     return "Scylla data downloaded and normalized"
 
@@ -118,6 +137,7 @@ def smoke_environment() -> dict[str, str]:
     import sys
 
     normalize_scylla_layout(Path("/data"))
+    install_reference_tokenizer(Path("/workspace/pg/reference_tokenizer"), Path("/data"))
     subprocess.run([sys.executable, "/workspace/pg/scripts/check_scylla_assets.py", "--root", "/data"], check=True)
     flash_spec = importlib.util.find_spec("flash_attn_interface")
     return {
@@ -136,6 +156,7 @@ def train(seed: int = 1337) -> dict[str, object]:
     workdir.mkdir(parents=True, exist_ok=True)
     (workdir / "scripts").mkdir(parents=True, exist_ok=True)
     normalize_scylla_layout(Path("/data"))
+    install_reference_tokenizer(Path("/workspace/pg/reference_tokenizer"), Path("/data"))
 
     env = {**os.environ, **scylla_reference_env(seed, "/data")}
     subprocess.run([sys.executable, str(workdir / "scripts" / "check_scylla_assets.py"), "--root", "/data"], env=env, check=True)
