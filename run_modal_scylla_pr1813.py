@@ -146,11 +146,17 @@ def smoke_environment() -> dict[str, str]:
     val_path = Path("/data/datasets/fineweb10B_scylla/fineweb_val_000000.bin")
     with np.load("/data/tokenizer/candidate.meta.npz", allow_pickle=False) as meta:
         base_bytes = np.asarray(meta["base_bytes"], dtype=np.int64)
+        has_leading_space = np.asarray(meta["has_leading_space"], dtype=np.bool_)
+        is_boundary_token = np.asarray(meta["is_boundary_token"], dtype=np.bool_)
     header_bytes = 256 * np.dtype("<i4").itemsize
     n_tokens = (val_path.stat().st_size - header_bytes) // np.dtype("<u2").itemsize
     val_tokens = np.memmap(val_path, mode="r", dtype="<u2", offset=header_bytes, shape=(n_tokens,))
-    token_count = int(n_tokens - 1)
-    byte_count = int(base_bytes[np.asarray(val_tokens[:-1], dtype=np.int64)].sum())
+    prev_ids = np.asarray(val_tokens[:-1], dtype=np.int64)
+    tgt_ids = np.asarray(val_tokens[1:], dtype=np.int64)
+    token_count = int(tgt_ids.size)
+    token_bytes = base_bytes[tgt_ids].copy()
+    token_bytes += (has_leading_space[tgt_ids] & ~is_boundary_token[prev_ids]).astype(np.int64)
+    byte_count = int(token_bytes.sum())
     return {
         "python": sys.version.split()[0],
         "flash_attn_interface": "present" if flash_spec else "missing",
