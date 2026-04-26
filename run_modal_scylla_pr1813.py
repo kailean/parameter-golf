@@ -2,7 +2,7 @@
 
 This intentionally does not use the older INT4/SP1024 `run_modal_sub105.py` lane.
 It runs the exact Scylla config recorded in PR1813 and normalizes the public
-LightSpeedUp Hugging Face dataset into the path layout expected by that script.
+Amarck Hugging Face dataset into the path layout expected by that script.
 """
 from __future__ import annotations
 
@@ -75,11 +75,6 @@ def install_reference_tokenizer(reference_dir: Path, root: Path) -> None:
         "candidate.vocab": reference_dir / "candidate.vocab",
         "candidate.meta.npz": reference_dir / "candidate.pr1813_compat.meta.npz",
     }
-    if not all(path.is_file() for path in sources.values()):
-        sources = {
-            "candidate.vocab": reference_dir / "candidate.vocab",
-            "candidate.meta.npz": reference_dir / "candidate.meta.npz",
-        }
 
     tokenizer_target = root / "tokenizer"
     tokenizer_target.mkdir(parents=True, exist_ok=True)
@@ -114,9 +109,9 @@ def download_scylla_data() -> str:
 
     root = Path("/data")
     marker = root / "amarck_scylla" / "datasets" / "fineweb10B_scylla" / "fineweb_train_000193.bin"
-    corrected_meta = root / "amarck_scylla" / "datasets" / "fineweb10B_scylla_v2" / "scylla_corrected.meta.npz"
+    hf_meta = root / "amarck_scylla" / "tokenizer" / "candidate.meta.npz"
     meta = root / "tokenizer" / "candidate.meta.npz"
-    if marker.is_file() and corrected_meta.is_file() and meta.is_file():
+    if marker.is_file() and hf_meta.is_file() and meta.is_file():
         normalize_scylla_layout(root)
         install_reference_tokenizer(Path("/workspace/pg/reference_tokenizer"), root)
         vol.commit()
@@ -132,7 +127,7 @@ def download_scylla_data() -> str:
             "--include",
             "datasets/fineweb10B_scylla/*",
             "--include",
-            "datasets/fineweb10B_scylla_v2/scylla_corrected.*",
+            "tokenizer/*",
             "--local-dir",
             str(root / "amarck_scylla"),
         ],

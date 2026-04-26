@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import numpy as np
+
 from run_modal_scylla_pr1813 import (
     install_reference_tokenizer,
     normalize_scylla_layout,
@@ -87,3 +89,14 @@ def test_install_reference_tokenizer_ignores_corrected_amarck_meta_when_pr1813_c
 
     assert (root / "tokenizer" / "candidate.vocab").read_text(encoding="utf-8") == "pr"
     assert (root / "tokenizer" / "candidate.meta.npz").read_bytes() == b"pr1813-meta"
+
+
+def test_pr1813_compat_metadata_matches_scylla_tm0054():
+    meta_path = Path(__file__).resolve().parents[1] / "frontier_sources/scylla_pr1813/candidate.pr1813_compat.meta.npz"
+
+    with np.load(meta_path, allow_pickle=False) as meta:
+        assert meta["source_model_name"].item() == "scylla_tm0054"
+        assert int(meta["vocab_size"].item()) == 998
+        assert int(meta["base_bytes"].sum()) == 4118
+        assert int(meta["has_leading_space"].sum()) == 640
+        assert int(meta["is_boundary_token"].sum()) == 5
