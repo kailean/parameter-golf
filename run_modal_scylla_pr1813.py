@@ -69,7 +69,7 @@ def normalize_scylla_layout(root: Path) -> None:
 
 image = (
     modal.Image.from_registry("matotezitanka/proteus-pytorch:community")
-    .pip_install("huggingface-hub")
+    .pip_install("huggingface-hub", extra_options="--break-system-packages")
     .add_local_file("frontier_sources/scylla_pr1813/train_gpt.py", TRAIN_SCRIPT_REMOTE, copy=True)
     .add_local_file("scripts/check_scylla_assets.py", "/workspace/pg/scripts/check_scylla_assets.py", copy=True)
     .add_local_file("scripts/check_scylla_artifact.py", "/workspace/pg/scripts/check_scylla_artifact.py", copy=True)
