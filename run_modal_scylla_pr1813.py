@@ -92,7 +92,7 @@ def download_scylla_data() -> str:
 
     subprocess.run(
         [
-            "huggingface-cli",
+            "hf",
             "download",
             DATASET_REPO,
             "--repo-type",
