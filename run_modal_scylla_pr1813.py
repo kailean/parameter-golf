@@ -15,6 +15,7 @@ import modal
 DATASET_REPO = "amarck/parameter-golf-scylla"
 APP_NAME = "parameter-golf-scylla-pr1813"
 VOLUME_NAME = "pg-scylla-pr1813-data"
+TRAIN_SCRIPT_LOCAL = "frontier_sources/scylla_pr1813/train_gpt_modal.py"
 TRAIN_SCRIPT_REMOTE = "/workspace/pg/train_gpt.py"
 
 
@@ -90,7 +91,7 @@ def install_reference_tokenizer(reference_dir: Path, root: Path) -> None:
 image = (
     modal.Image.from_registry("matotezitanka/proteus-pytorch:community")
     .pip_install("huggingface-hub", extra_options="--break-system-packages")
-    .add_local_file("frontier_sources/scylla_pr1813/train_gpt.py", TRAIN_SCRIPT_REMOTE, copy=True)
+    .add_local_file(TRAIN_SCRIPT_LOCAL, TRAIN_SCRIPT_REMOTE, copy=True)
     .add_local_file("frontier_sources/scylla_pr1813/candidate.vocab", "/workspace/pg/reference_tokenizer/candidate.vocab", copy=True)
     .add_local_file("frontier_sources/scylla_pr1813/candidate.meta.npz", "/workspace/pg/reference_tokenizer/candidate.meta.npz", copy=True)
     .add_local_file("frontier_sources/scylla_pr1813/candidate.pr1813_compat.meta.npz", "/workspace/pg/reference_tokenizer/candidate.pr1813_compat.meta.npz", copy=True)

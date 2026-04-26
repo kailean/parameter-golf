@@ -3,6 +3,7 @@ from pathlib import Path
 import numpy as np
 
 from run_modal_scylla_pr1813 import (
+    TRAIN_SCRIPT_LOCAL,
     install_reference_tokenizer,
     normalize_scylla_layout,
     scylla_reference_env,
@@ -16,6 +17,15 @@ def test_scylla_reference_env_matches_pr1813():
     assert env["BIGRAM_DIM"] == "40"
     assert env["TTT_ENABLED"] == "0"
     assert env["DATA_PATH"] == "/data/datasets/fineweb10B_scylla"
+
+
+def test_modal_uses_rank0_compression_train_script():
+    script = Path(TRAIN_SCRIPT_LOCAL)
+
+    text = script.read_text(encoding="utf-8")
+    assert script.name == "train_gpt_modal.py"
+    assert "Rank 0 is the only writer" in text
+    assert script.stat().st_size < 106_000
 
 
 def test_normalize_scylla_layout_creates_expected_symlinks(tmp_path):
