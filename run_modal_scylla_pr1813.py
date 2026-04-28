@@ -7,6 +7,7 @@ Amarck Hugging Face dataset into the path layout expected by that script.
 from __future__ import annotations
 
 import os
+from collections.abc import Mapping
 from pathlib import Path
 
 import modal
@@ -17,10 +18,22 @@ APP_NAME = "parameter-golf-scylla-pr1813"
 VOLUME_NAME = "pg-scylla-pr1813-data"
 TRAIN_SCRIPT_LOCAL = "frontier_sources/scylla_pr1813/train_gpt_modal.py"
 TRAIN_SCRIPT_REMOTE = "/workspace/pg/train_gpt.py"
+SAFE_SCYLLA_OVERRIDES = {
+    "BIGRAM_DIM",
+    "QK_GAIN_INIT",
+    "ENABLE_LOOPING_AT",
+    "LOOP_START",
+    "LOOP_END",
+    "NUM_LOOPS",
+}
 
 
-def scylla_reference_env(seed: int, data_root: str = "/data") -> dict[str, str]:
-    return {
+def scylla_reference_env(
+    seed: int,
+    data_root: str = "/data",
+    overrides: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    env = {
         "TORCHINDUCTOR_CACHE_DIR": "/tmp/torchinductor_pg",
         "TMPDIR": "/tmp",
         "RUN_ID": f"scylla_qk525_loop3to5_bg40_seed{seed}",
@@ -43,6 +56,39 @@ def scylla_reference_env(seed: int, data_root: str = "/data") -> dict[str, str]:
         "LOOP_END": "5",
         "ENABLE_LOOPING_AT": "0.35",
     }
+    if overrides:
+        unsafe = sorted(set(overrides) - SAFE_SCYLLA_OVERRIDES)
+        if unsafe:
+            raise ValueError(f"unsafe Scylla override(s): {', '.join(unsafe)}")
+        env.update({key: str(value) for key, value in overrides.items()})
+        suffix = "_".join(f"{key.lower()}{env[key]}" for key in sorted(overrides))
+        env["RUN_ID"] = f"{env['RUN_ID']}_{suffix}"
+    return env
+
+
+def scylla_override_env(
+    *,
+    bigram_dim: int | None = None,
+    qk_gain: float | None = None,
+    loop_at: float | None = None,
+    loop_start: int | None = None,
+    loop_end: int | None = None,
+    num_loops: int | None = None,
+) -> dict[str, str]:
+    overrides: dict[str, str] = {}
+    if bigram_dim is not None:
+        overrides["BIGRAM_DIM"] = str(bigram_dim)
+    if qk_gain is not None:
+        overrides["QK_GAIN_INIT"] = str(qk_gain)
+    if loop_at is not None:
+        overrides["ENABLE_LOOPING_AT"] = str(loop_at)
+    if loop_start is not None:
+        overrides["LOOP_START"] = str(loop_start)
+    if loop_end is not None:
+        overrides["LOOP_END"] = str(loop_end)
+    if num_loops is not None:
+        overrides["NUM_LOOPS"] = str(num_loops)
+    return overrides
 
 
 def normalize_scylla_layout(root: Path) -> None:
@@ -176,7 +222,15 @@ def smoke_environment() -> dict[str, str]:
 
 
 @app.function(image=image, volumes={"/data": vol}, gpu="H100:8", timeout=3600, cpu=32, memory=240_000)
-def train(seed: int = 1337) -> dict[str, object]:
+def train(
+    seed: int = 1337,
+    bigram_dim: int | None = None,
+    qk_gain: float | None = None,
+    loop_at: float | None = None,
+    loop_start: int | None = None,
+    loop_end: int | None = None,
+    num_loops: int | None = None,
+) -> dict[str, object]:
     import re
     import subprocess
     import sys
@@ -187,7 +241,15 @@ def train(seed: int = 1337) -> dict[str, object]:
     normalize_scylla_layout(Path("/data"))
     install_reference_tokenizer(Path("/workspace/pg/reference_tokenizer"), Path("/data"))
 
-    env = {**os.environ, **scylla_reference_env(seed, "/data")}
+    overrides = scylla_override_env(
+        bigram_dim=bigram_dim,
+        qk_gain=qk_gain,
+        loop_at=loop_at,
+        loop_start=loop_start,
+        loop_end=loop_end,
+        num_loops=num_loops,
+    )
+    env = {**os.environ, **scylla_reference_env(seed, "/data", overrides)}
     subprocess.run([sys.executable, str(workdir / "scripts" / "check_scylla_assets.py"), "--root", "/data"], env=env, check=True)
     subprocess.run([sys.executable, str(workdir / "scripts" / "preflight_scylla.py")], env=env, check=True)
 

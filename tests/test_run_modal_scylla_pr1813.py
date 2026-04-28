@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from run_modal_scylla_pr1813 import (
     TRAIN_SCRIPT_LOCAL,
@@ -17,6 +18,18 @@ def test_scylla_reference_env_matches_pr1813():
     assert env["BIGRAM_DIM"] == "40"
     assert env["TTT_ENABLED"] == "0"
     assert env["DATA_PATH"] == "/data/datasets/fineweb10B_scylla"
+
+
+def test_scylla_reference_env_accepts_safe_overrides():
+    env = scylla_reference_env(1337, "/data", {"BIGRAM_DIM": "44", "QK_GAIN_INIT": "5.5"})
+
+    assert env["BIGRAM_DIM"] == "44"
+    assert env["QK_GAIN_INIT"] == "5.5"
+
+
+def test_scylla_reference_env_rejects_unsafe_overrides():
+    with pytest.raises(ValueError, match="unsafe Scylla override"):
+        scylla_reference_env(1337, "/data", {"TTT_ENABLED": "1"})
 
 
 def test_modal_uses_rank0_compression_train_script():
